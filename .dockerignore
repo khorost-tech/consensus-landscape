@@ -1,0 +1,9 @@
+**/node_modules
+**/dist
+frontend/dist
+docs/.vitepress/dist
+.git
+.github
+.idea
+*.md
+!README.md
