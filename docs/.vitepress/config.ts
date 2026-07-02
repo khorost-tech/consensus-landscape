@@ -6,7 +6,7 @@ export default withMermaid(
     title: 'Consensus Landscape',
     description: 'Интерактивный симулятор алгоритмов консенсуса',
     lang: 'ru-RU',
-    base: process.env.DOCS_BASE ?? '/consensus-landscape/docs/',
+    base: process.env.DOCS_BASE ?? '/docs/',
     cleanUrls: true,
     lastUpdated: true,
 
@@ -81,7 +81,7 @@ export default withMermaid(
         },
       },
       editLink: {
-        pattern: 'https://github.com/khorost/consensus-landscape/edit/main/docs/:path',
+        pattern: 'https://github.com/khorost-tech/consensus-landscape/edit/main/docs/:path',
         text: 'Предложить правку на GitHub',
       },
       footer: {
@@ -90,7 +90,7 @@ export default withMermaid(
       },
 
       socialLinks: [
-        { icon: 'github', link: 'https://github.com/khorost/consensus-landscape' },
+        { icon: 'github', link: 'https://github.com/khorost-tech/consensus-landscape' },
       ],
     },
 
