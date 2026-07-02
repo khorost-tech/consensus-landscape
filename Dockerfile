@@ -9,7 +9,9 @@
 # и на поддомене отдадут 404 на ассеты.
 
 # ---------- build ----------
-FROM node:22-alpine AS build
+# node:22-slim (Debian/glibc), НЕ alpine/musl: frontend/package.json пинит
+# @rollup/rollup-linux-x64-gnu (glibc-вариант) — на musl npm ci даёт EBADPLATFORM.
+FROM node:22-slim AS build
 WORKDIR /app
 
 # Симулятор (SPA). base = '/' вне GITHUB_ACTIONS (см. frontend/vite.config.ts).
