@@ -14,6 +14,12 @@
 FROM node:22-slim AS build
 WORKDIR /app
 
+# git нужен VitePress (lastUpdated в docs/.vitepress/config.ts зовёт `git log`).
+# Без .git в контексте дата просто не покажется — сборка не падает (ENOENT падает).
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends git \
+  && rm -rf /var/lib/apt/lists/*
+
 # Симулятор (SPA). base = '/' вне GITHUB_ACTIONS (см. frontend/vite.config.ts).
 COPY frontend/package.json frontend/package-lock.json ./frontend/
 RUN cd frontend && npm ci
