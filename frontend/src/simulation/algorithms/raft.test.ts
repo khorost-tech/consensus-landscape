@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { RaftAlgorithm } from './raft';
-import { ClusterConfig, NodeState, Message } from '../types';
+import { ClusterConfig, NodeState, Message, ClientRequest } from '../types';
 
 const raft = new RaftAlgorithm();
 
@@ -22,6 +22,14 @@ function makeNode(id: string, config = makeConfig()): NodeState {
 
 function msg(overrides: Partial<Message> & { type: Message['type']; from: string; to: string }): Message {
   return { id: 'test', term: 0, payload: {}, ...overrides };
+}
+
+function req(command: string, id = command): ClientRequest {
+  return {
+    requestId: `req_${id}`,
+    entryId: `entry_${id}`,
+    command,
+  };
 }
 
 describe('RaftAlgorithm', () => {
@@ -123,7 +131,7 @@ describe('RaftAlgorithm', () => {
         payload: { voteGranted: true },
       }));
       expect(node.role).toBe('leader');
-      const actions = raft.onClientRequest(node, 'set x=1');
+      const actions = raft.onClientRequest(node, req('set x=1'));
       expect(node.log.length).toBe(1);
       expect(node.log[0].command).toBe('set x=1');
       // Should send append_entries to peers
@@ -133,7 +141,7 @@ describe('RaftAlgorithm', () => {
 
     it('non-leader redirects client request', () => {
       const node = makeNode('node_1');
-      const actions = raft.onClientRequest(node, 'cmd');
+      const actions = raft.onClientRequest(node, req('cmd'));
       const redirect = actions.find(a => a.message?.type === 'client_response');
       expect(redirect!.message!.payload.redirect).toBe(true);
     });
@@ -141,7 +149,14 @@ describe('RaftAlgorithm', () => {
     it('follower appends entries from leader', () => {
       const follower = makeNode('node_1');
       follower.currentTerm = 1;
-      const entry = { term: 1, index: 0, command: 'cmd_1', committed: false };
+      const entry = {
+        entryId: 'entry_cmd_1',
+        requestId: 'req_cmd_1',
+        term: 1,
+        index: 0,
+        command: 'cmd_1',
+        committed: false,
+      };
       raft.onMessage(follower, msg({
         type: 'append_entries', from: 'node_0', to: 'node_1', term: 1,
         payload: {
@@ -160,7 +175,7 @@ describe('RaftAlgorithm', () => {
         type: 'request_vote_response', from: 'node_1', to: 'node_0', term: 1,
         payload: { voteGranted: true },
       }));
-      raft.onClientRequest(leader, 'cmd_1');
+      raft.onClientRequest(leader, req('cmd_1'));
       // Follower responds with success
       const actions = raft.onMessage(leader, msg({
         type: 'append_entries_response', from: 'node_1', to: 'node_0', term: 1,
@@ -209,6 +224,79 @@ describe('RaftAlgorithm', () => {
       }));
       const timeout = actions.find(a => a.type === 'set_timeout' && a.timeout?.type === 'election');
       expect(timeout).toBeDefined();
+    });
+
+    it('sends install_snapshot when follower is behind trimmed prefix', () => {
+      const node = makeNode('node_0');
+      node.role = 'leader';
+      node.currentTerm = 3;
+      node.logBaseIndex = 5;
+      node.logBaseTerm = 2;
+      node.log = [
+        { ...req('cmd_5'), term: 3, index: 5, committed: true },
+        { ...req('cmd_6'), term: 3, index: 6, committed: false },
+      ];
+      node.nextIndex.set('node_1', 2);
+
+      const actions = raft.onTimeout(node, 'heartbeat');
+      const snapshot = actions.find(a => a.message?.type === 'install_snapshot' && a.message.to === 'node_1');
+
+      expect(snapshot).toBeDefined();
+      expect(snapshot!.message!.payload.lastIncludedIndex).toBe(4);
+      expect(snapshot!.message!.payload.lastIncludedTerm).toBe(2);
+    });
+
+    it('follower installs snapshot and acknowledges it', () => {
+      const node = makeNode('node_1');
+      node.currentTerm = 3;
+      node.log = [
+        { ...req('old_0'), term: 1, index: 0, committed: true },
+        { ...req('old_1'), term: 2, index: 1, committed: false },
+      ];
+
+      const actions = raft.onMessage(node, msg({
+        type: 'install_snapshot',
+        from: 'node_0',
+        to: 'node_1',
+        term: 3,
+        payload: {
+          leaderId: 'node_0',
+          lastIncludedIndex: 4,
+          lastIncludedTerm: 2,
+          leaderCommit: 4,
+        },
+      }));
+
+      expect(node.logBaseIndex).toBe(5);
+      expect(node.logBaseTerm).toBe(2);
+      expect(node.commitIndex).toBe(4);
+      expect(node.lastApplied).toBe(4);
+      expect(actions.some(a => a.message?.type === 'install_snapshot_response')).toBe(true);
+    });
+
+    it('leader resumes append_entries after snapshot acknowledgement', () => {
+      const node = makeNode('node_0');
+      node.role = 'leader';
+      node.currentTerm = 3;
+      node.logBaseIndex = 5;
+      node.logBaseTerm = 2;
+      node.log = [
+        { ...req('cmd_5'), term: 3, index: 5, committed: true },
+        { ...req('cmd_6'), term: 3, index: 6, committed: false },
+      ];
+
+      const actions = raft.onMessage(node, msg({
+        type: 'install_snapshot_response',
+        from: 'node_1',
+        to: 'node_0',
+        term: 3,
+        payload: { lastIncludedIndex: 4 },
+      }));
+
+      const append = actions.find(a => a.message?.type === 'append_entries');
+      expect(append).toBeDefined();
+      expect(append!.message!.payload.prevLogIndex).toBe(4);
+      expect(append!.message!.payload.prevLogTerm).toBe(2);
     });
   });
 

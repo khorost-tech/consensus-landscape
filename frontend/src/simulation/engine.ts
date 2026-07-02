@@ -1,7 +1,7 @@
 import {
   SimEvent, NodeState, NodeId, Action, ClusterConfig,
   Message, SimulationMetrics, EventType, TimeoutType,
-  LiveStats, ClientState,
+  LiveStats, ClientState, LogEntry,
 } from './types';
 import { ConsensusAlgorithm } from './algorithms/interface';
 import { NetworkModel } from './network';
@@ -9,16 +9,6 @@ import {
   LATENCY_WINDOW_SIZE, CLIENT_RETRY_DELAY_BASE, CLIENT_RETRY_DELAY_JITTER, DEAD_NODE_RETRY_DELAY,
   METRICS_HISTORY_LIMIT, NODE_LOG_LIMIT, MESSAGE_EDGE_DELIVERY_FRACTION,
 } from './constants';
-
-let nextEventId = 0;
-function generateEventId(): string {
-  return `evt_${nextEventId++}`;
-}
-
-let nextMsgId = 0;
-function generateMsgId(): string {
-  return `msg_${nextMsgId++}`;
-}
 
 export interface ActiveMessage {
   message: Message;
@@ -33,6 +23,8 @@ export interface ActiveMessage {
 /** Tracks a client request through the system */
 interface PendingRequest {
   time: number;
+  requestId: string;
+  entryId: string;
   command: string;
   clientId: string;
   targetNode: NodeId;
@@ -158,6 +150,9 @@ export class SimulationEngine {
   private metrics: SimulationMetrics;
   private activeMessages: ActiveMessage[] = [];
   private rng: () => number;
+  private nextEventId = 0;
+  private nextMsgId = 0;
+  private nextRequestId = 0;
 
   private pendingClientRequests: Map<string, PendingRequest> = new Map();
   private liveStats: LiveStats;
@@ -175,6 +170,7 @@ export class SimulationEngine {
     this.config = config;
     this.network = new NetworkModel(config.networkConfig);
     this.rng = createSeededRng(seed ?? Date.now());
+    this.algorithm.setRandomSource(this.rng);
     this.metrics = {
       commitTimestamps: [],
       commitLatencies: [],
@@ -226,14 +222,26 @@ export class SimulationEngine {
     return electionTimeoutMin + this.rng() * (electionTimeoutMax - electionTimeoutMin);
   }
 
+  private generateEventId(): string {
+    return `evt_${this.nextEventId++}`;
+  }
+
+  private generateMsgId(): string {
+    return `msg_${this.nextMsgId++}`;
+  }
+
+  private generateRequestId(): string {
+    return `req_${this.nextRequestId++}`;
+  }
+
   private scheduleTimeout(nodeId: NodeId, type: TimeoutType, duration: number): void {
     const key = `${nodeId}:${type}`;
     const existing = this.activeTimeouts.get(key);
     if (existing) {
       this.eventQueue.cancel(existing.event.id); // O(1) lazy cancel
     }
-    const event: SimEvent = {
-      id: generateEventId(),
+      const event: SimEvent = {
+      id: this.generateEventId(),
       time: this.time + duration,
       type: 'timeout',
       target: nodeId,
@@ -261,7 +269,7 @@ export class SimulationEngine {
       switch (action.type) {
         case 'send_message': {
           if (!action.message) break;
-          const msg: Message = { ...action.message, id: generateMsgId() };
+          const msg: Message = { ...action.message, id: this.generateMsgId() };
 
           this.liveStats.totalMessages++;
           if (msg.type === 'nack') {
@@ -290,7 +298,7 @@ export class SimulationEngine {
 
           if (!dropped) {
             this.insertEvent({
-              id: generateEventId(),
+              id: this.generateEventId(),
               time: deliverTime,
               type: 'message_arrive',
               target: msg.to,
@@ -310,63 +318,81 @@ export class SimulationEngine {
           break;
         }
         case 'commit_entry': {
-          const node = this.nodes.get(nodeId);
-          if (node) {
-            node.meta.lastCommitTime = this.time;
-            for (const entry of node.log) {
-              if (entry.committed) {
-                const req = this.pendingClientRequests.get(entry.command);
-                if (req) {
-                  req.connectionState = 'committed';
-                  const latency = this.time - req.time;
-                  this.metrics.commitTimestamps.push(this.time);
-                  this.metrics.commitLatencies.push(latency);
-                  this.liveStats.totalCommits++;
-                  // Record time of first commit (used as "readiness time" for Paxos)
-                  if (this.liveStats.electionTime === null) {
-                    this.liveStats.electionTime = this.time;
-                  }
-
-                  this.latencyWindow.push(latency);
-                  if (this.latencyWindow.length > LATENCY_WINDOW_SIZE) this.latencyWindow.shift();
-                  this.liveStats.avgLatency = this.latencyWindow.reduce((a, b) => a + b, 0) / this.latencyWindow.length;
-
-                  const client = this.clients.find(c => c.id === req.clientId);
-                  if (client) {
-                    client.pendingCommand = null;
-                    client.completedCommands++;
-                    client.lastLatency = latency;
-                    // Keep client.targetNode so it re-sends to the same node next time
-                    // (reduces dueling proposers in Paxos; for Raft, redirect handles leader changes)
-
-                    // Create visible response message from node to client
-                    const respDelay = this.network.getDelay(nodeId, nodeId, this.rng);
-                    const respMsg: Message = {
-                      id: generateMsgId(),
-                      type: 'client_response',
-                      from: nodeId,
-                      to: req.clientId,
-                      term: 0,
-                      payload: { command: entry.command },
-                    };
-                    this.activeMessages.push({
-                      message: respMsg,
-                      sendTime: this.time,
-                      deliverTime: this.time + respDelay,
-                      arriveTime: this.time + respDelay,
-                      dropped: false,
-                    });
-
-                  }
-                  this.pendingClientRequests.delete(entry.command);
-                }
-              }
-            }
-          }
+          this.handleCommitEntry(nodeId);
+          break;
+        }
+        case 'apply_entry': {
+          this.applyCommittedEntries(nodeId);
           break;
         }
       }
     }
+  }
+
+  private handleCommitEntry(nodeId: NodeId): void {
+    const node = this.nodes.get(nodeId);
+    if (!node) return;
+
+    node.meta.lastCommitTime = this.time;
+    for (const entry of node.log) {
+      if (!entry.committed) continue;
+
+      const req = this.pendingClientRequests.get(entry.requestId);
+      if (!req) continue;
+
+      req.connectionState = 'committed';
+      const latency = this.time - req.time;
+      this.metrics.commitTimestamps.push(this.time);
+      this.metrics.commitLatencies.push(latency);
+      this.liveStats.totalCommits++;
+      if (this.liveStats.electionTime === null) {
+        this.liveStats.electionTime = this.time;
+      }
+
+      this.latencyWindow.push(latency);
+      if (this.latencyWindow.length > LATENCY_WINDOW_SIZE) this.latencyWindow.shift();
+      this.liveStats.avgLatency = this.latencyWindow.reduce((a, b) => a + b, 0) / this.latencyWindow.length;
+
+      const client = this.clients.find(c => c.id === req.clientId);
+      if (client) {
+        client.pendingCommand = null;
+        client.completedCommands++;
+        client.lastLatency = latency;
+
+        const respDelay = this.network.getDelay(nodeId, nodeId, this.rng);
+        const respMsg: Message = {
+          id: this.generateMsgId(),
+          type: 'client_response',
+          from: nodeId,
+          to: req.clientId,
+          term: 0,
+          payload: { command: entry.command, requestId: entry.requestId, entryId: entry.entryId },
+        };
+        this.activeMessages.push({
+          message: respMsg,
+          sendTime: this.time,
+          deliverTime: this.time + respDelay,
+          arriveTime: this.time + respDelay,
+          dropped: false,
+        });
+      }
+
+      this.pendingClientRequests.delete(entry.requestId);
+    }
+  }
+
+  private applyCommittedEntries(nodeId: NodeId): void {
+    const node = this.nodes.get(nodeId);
+    if (!node || node.status !== 'alive') return;
+
+    const appliedEntries = node.log
+      .filter(entry => entry.committed && entry.index > node.lastApplied)
+      .sort((left, right) => left.index - right.index);
+
+    if (appliedEntries.length === 0) return;
+
+    node.lastApplied = appliedEntries[appliedEntries.length - 1].index;
+    node.meta.lastApplyTime = this.time;
   }
 
   /** Handle redirect: client got rejected, needs to find the real leader */
@@ -375,7 +401,7 @@ export class SimulationEngine {
     this.liveStats.rejectedRequests++;
 
     // Find which pending request was for this node
-    for (const [command, req] of this.pendingClientRequests) {
+    for (const [requestId, req] of this.pendingClientRequests) {
       if (req.targetNode === rejectedBy) {
         req.retries++;
 
@@ -402,7 +428,7 @@ export class SimulationEngine {
 
         // Create a visible "redirect" message from old node to new
         const redirectMsg: Message = {
-          id: generateMsgId(),
+          id: this.generateMsgId(),
           type: 'client_request',
           from: rejectedBy,
           to: nextTarget,
@@ -425,11 +451,11 @@ export class SimulationEngine {
 
         // Re-inject the client request to the new target after delay
         this.insertEvent({
-          id: generateEventId(),
+          id: this.generateEventId(),
           time: redirectDeliverTime,
           type: 'client_request',
           target: nextTarget,
-          payload: { command, clientId: req.clientId },
+          payload: { command: req.command, clientId: req.clientId, requestId, entryId: req.entryId },
         });
 
         break; // handle one redirect at a time
@@ -445,11 +471,17 @@ export class SimulationEngine {
     const node = this.nodes.get(event.target);
     if (!node) return event;
 
-    if (node.status === 'dead' && event.type !== 'node_recovery') {
+    if (
+      node.status === 'dead'
+      && event.type !== 'node_recovery'
+      && event.type !== 'network_partition'
+      && event.type !== 'heal_partition'
+    ) {
       // Node is dead — if this was a client request, trigger redirect
       if (event.type === 'client_request' && event.payload.command) {
         const clientId = event.payload.clientId ?? 'client_0';
-        const req = this.pendingClientRequests.get(event.payload.command);
+        const requestId = event.payload.requestId;
+        const req = requestId ? this.pendingClientRequests.get(requestId) : undefined;
         if (req) {
           // Simulate timeout → client retries to another node
           const alive = Array.from(this.nodes.entries())
@@ -464,11 +496,11 @@ export class SimulationEngine {
 
             // Retry after a short timeout (simulating client timeout)
             this.insertEvent({
-              id: generateEventId(),
+              id: this.generateEventId(),
               time: this.time + DEAD_NODE_RETRY_DELAY,
               type: 'client_request',
               target: nextTarget,
-              payload: { command: event.payload.command, clientId },
+              payload: { command: event.payload.command, clientId, requestId: req.requestId, entryId: req.entryId },
             });
           }
         }
@@ -500,10 +532,14 @@ export class SimulationEngine {
       case 'client_request': {
         if (event.payload.command) {
           const clientId = event.payload.clientId ?? 'client_0';
+          const requestId = event.payload.requestId ?? this.generateRequestId();
+          const entryId = event.payload.entryId ?? requestId;
 
-          if (!this.pendingClientRequests.has(event.payload.command)) {
-            this.pendingClientRequests.set(event.payload.command, {
+          if (!this.pendingClientRequests.has(requestId)) {
+            this.pendingClientRequests.set(requestId, {
               time: this.time,
+              requestId,
+              entryId,
               command: event.payload.command,
               clientId,
               targetNode: event.target,
@@ -518,12 +554,16 @@ export class SimulationEngine {
             client.targetNode = event.target;
           }
 
-          actions = this.algorithm.onClientRequest(node, event.payload.command);
+          actions = this.algorithm.onClientRequest(node, {
+            requestId,
+            entryId,
+            command: event.payload.command,
+          });
 
           // If node accepted the request (returns send_message), transition to replicating
           const accepted = actions.some(a => a.type === 'send_message');
           if (accepted) {
-            const req = this.pendingClientRequests.get(event.payload.command);
+            const req = this.pendingClientRequests.get(requestId);
             if (req) req.connectionState = 'replicating';
           }
         }
@@ -559,9 +599,18 @@ export class SimulationEngine {
         }
         break;
       }
+      case 'network_partition': {
+        this.setPartitions(event.payload.partitions ?? []);
+        break;
+      }
+      case 'heal_partition': {
+        this.setPartitions([]);
+        break;
+      }
     }
 
     this.processActions(event.target, actions);
+    this.processActions(event.target, [{ type: 'apply_entry' }]);
 
     // Track leader changes and current state
     if (prevRole !== 'leader' && prevRole !== 'leading' && (node.role === 'leader' || node.role === 'leading')) {
@@ -611,6 +660,25 @@ export class SimulationEngine {
     return event;
   }
 
+  setPartitions(partitions: NodeId[][]): void {
+    this.config = {
+      ...this.config,
+      networkConfig: {
+        ...this.config.networkConfig,
+        partitions: partitions.map(group => [...group]),
+      },
+    };
+    this.network.updateConfig(this.config.networkConfig);
+  }
+
+  clearPartitions(): void {
+    this.setPartitions([]);
+  }
+
+  getPartitions(): NodeId[][] {
+    return this.config.networkConfig.partitions.map(group => [...group]);
+  }
+
   /** Trim accumulated history to bound memory during long simulations */
   private trimHistory(): void {
     const ml = METRICS_HISTORY_LIMIT;
@@ -638,10 +706,10 @@ export class SimulationEngine {
     for (const [, node] of this.nodes) {
       if (node.log.length > NODE_LOG_LIMIT) {
         const excess = node.log.length - NODE_LOG_LIMIT;
+        const lastTrimmedEntry = node.log[excess - 1];
+        node.logBaseIndex = lastTrimmedEntry.index + 1;
+        node.logBaseTerm = lastTrimmedEntry.term;
         node.log.splice(0, excess);
-        // Adjust commitIndex/lastApplied
-        node.commitIndex = Math.max(-1, node.commitIndex - excess);
-        node.lastApplied = Math.max(-1, node.lastApplied - excess);
       }
     }
 
@@ -676,7 +744,7 @@ export class SimulationEngine {
     let bestCommitCount = 0;
     for (const [id, n] of this.nodes) {
       if (id === recoveredNodeId || n.status !== 'alive') continue;
-      const committed = n.log.filter(e => e.committed).length;
+      const committed = n.commitIndex + 1;
       if (committed > bestCommitCount) {
         bestCommitCount = committed;
         bestPeer = n;
@@ -686,8 +754,8 @@ export class SimulationEngine {
     if (!bestPeer || bestCommitCount === 0) return;
 
     // Determine which commands the recovered node is missing
-    const knownCommands = new Set(recoveredNode.log.filter(e => e.committed).map(e => e.command));
-    const missingEntries = bestPeer.log.filter(e => e.committed && !knownCommands.has(e.command));
+    const knownEntryIds = new Set(recoveredNode.log.filter(e => e.committed).map(e => e.entryId));
+    const missingEntries = bestPeer.log.filter(e => e.committed && !knownEntryIds.has(e.entryId));
 
     // Schedule catch-up messages using algorithm-appropriate message type
     for (const entry of missingEntries) {
@@ -702,7 +770,7 @@ export class SimulationEngine {
         dropped: false,
       });
       this.insertEvent({
-        id: generateEventId(),
+        id: this.generateEventId(),
         time: deliverTime,
         type: 'message_arrive',
         target: recoveredNodeId,
@@ -712,38 +780,60 @@ export class SimulationEngine {
   }
 
   /** Build a catch-up message appropriate for the current algorithm */
-  private buildCatchUpMessage(from: NodeId, to: NodeId, entry: { term: number; index: number; command: string }): Message {
-    const base = { id: generateMsgId(), from, to, term: entry.term };
+  private buildCatchUpMessage(from: NodeId, to: NodeId, entry: LogEntry): Message {
+    const base = { id: this.generateMsgId(), from, to, term: entry.term };
     switch (this.algorithm.name) {
       case 'EPaxos':
         return {
           ...base, type: 'ep_commit',
           payload: {
-            instanceKey: `${from}:recovery_${entry.index}`,
-            command: entry.command, seq: entry.term, deps: [],
+            instanceKey: entry.instanceKey ?? `${from}:recovery_${entry.index}`,
+            command: entry.command, seq: entry.term, deps: [], index: entry.index,
+            requestId: entry.requestId, entryId: entry.entryId,
           },
         };
       case 'Zab':
         return {
           ...base, type: 'zab_sync',
           payload: {
-            entry: { term: entry.term, index: entry.index, command: entry.command, committed: true },
+            entry: {
+              entryId: entry.entryId,
+              requestId: entry.requestId,
+              zxid: entry.zxid,
+              term: entry.term,
+              index: entry.index,
+              command: entry.command,
+              committed: true,
+            },
           },
         };
       default: // Paxos, Multi-Paxos, Raft
         return {
           ...base, type: 'learn',
-          payload: { value: entry.command, proposalNumber: entry.term, commitIndex: entry.index },
+          payload: {
+            slot: entry.index,
+            value: { requestId: entry.requestId, entryId: entry.entryId, command: entry.command },
+            proposalNumber: entry.term,
+            commitIndex: entry.index,
+          },
         };
     }
   }
 
-  injectEvent(type: EventType, target: NodeId, time: number, payload: SimEvent['payload'] = {}): void {
-    this.insertEvent({ id: generateEventId(), time, type, target, payload });
+  injectEvent(type: EventType, target: NodeId, time: number, payload: SimEvent['payload'] = {}): string {
+    const id = this.generateEventId();
+    this.insertEvent({ id, time, type, target, payload });
+    return id;
+  }
+
+  cancelEvent(eventId: string): void {
+    this.eventQueue.cancel(eventId);
   }
 
   /** Submit client request — client remembers last known leader */
   submitClientRequest(command: string, clientId?: string, targetNode?: NodeId): void {
+    const requestId = this.generateRequestId();
+    const entryId = requestId;
     const cid = clientId ?? 'client_0';
     const client = this.clients.find(c => c.id === cid);
 
@@ -778,12 +868,12 @@ export class SimulationEngine {
     // Create visible message from client to node
     const delay = this.network.getDelay(target, target, this.rng); // approximate
     const clientMsg: Message = {
-      id: generateMsgId(),
+      id: this.generateMsgId(),
       type: 'client_request',
       from: cid,
       to: target,
       term: 0,
-      payload: { command },
+      payload: { command, requestId, entryId },
     };
     const clientDeliverTime = this.time + delay * MESSAGE_EDGE_DELIVERY_FRACTION;
     this.activeMessages.push({
@@ -794,7 +884,7 @@ export class SimulationEngine {
       dropped: false,
     });
 
-    this.injectEvent('client_request', target, clientDeliverTime, { command, clientId: cid });
+    this.injectEvent('client_request', target, clientDeliverTime, { command, clientId: cid, requestId, entryId });
   }
 
   addClient(): string {
@@ -807,9 +897,9 @@ export class SimulationEngine {
     if (this.clients.length <= 1) return null;
     const removed = this.clients.pop()!;
     // Cancel any pending requests for this client
-    for (const [cmd, req] of this.pendingClientRequests) {
+    for (const [requestId, req] of this.pendingClientRequests) {
       if (req.clientId === removed.id) {
-        this.pendingClientRequests.delete(cmd);
+        this.pendingClientRequests.delete(requestId);
       }
     }
     return removed.id;

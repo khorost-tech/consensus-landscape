@@ -6,48 +6,88 @@ export default withMermaid(
     title: 'Consensus Landscape',
     description: 'Интерактивный симулятор алгоритмов консенсуса',
     lang: 'ru-RU',
-    base: '/consensus-landscape/docs/',
+    base: process.env.DOCS_BASE ?? '/consensus-landscape/docs/',
+    cleanUrls: true,
+    lastUpdated: true,
 
     themeConfig: {
       nav: [
-        { text: 'Документация', link: '/' },
-        { text: 'Симулятор', link: 'https://khorost.github.io/consensus-landscape/' },
+        { text: 'Главная', link: '/' },
+        { text: 'Алгоритмы', link: '/overview' },
+        { text: 'Модель симуляции', link: '/simulation-model' },
+        { text: 'Симулятор', link: 'https://consensus.khorost.tech/' },
+        { text: 'GitHub', link: 'https://github.com/khorost-tech/consensus-landscape' },
       ],
+
+      search: {
+        provider: 'local',
+        options: {
+          translations: {
+            button: {
+              buttonText: 'Поиск',
+              buttonAriaLabel: 'Поиск по документации',
+            },
+            modal: {
+              noResultsText: 'Ничего не найдено',
+              resetButtonTitle: 'Очистить поиск',
+              footer: {
+                selectText: 'выбрать',
+                navigateText: 'перейти',
+                closeText: 'закрыть',
+              },
+            },
+          },
+        },
+      },
 
       sidebar: [
         {
-          text: 'Введение',
+          text: 'Старт',
+          collapsed: false,
           items: [
             { text: 'О проекте', link: '/' },
-            { text: 'Алгоритмы консенсуса', link: '/overview' },
+            { text: 'Что Такое Консенсус', link: '/overview' },
+            { text: 'Модель Симуляции', link: '/simulation-model' },
           ],
         },
         {
-          text: 'Симуляция',
-          items: [
-            { text: 'Модель симуляции', link: '/simulation-model' },
-          ],
-        },
-        {
-          text: 'Реализованные алгоритмы',
+          text: 'Алгоритмы',
+          collapsed: false,
           items: [
             { text: 'Raft', link: '/algorithms/raft' },
             { text: 'Basic Paxos', link: '/algorithms/paxos' },
             { text: 'Multi-Paxos', link: '/algorithms/multi-paxos' },
-            { text: 'Zab (ZooKeeper)', link: '/algorithms/zab' },
+            { text: 'Zab', link: '/algorithms/zab' },
             { text: 'EPaxos', link: '/algorithms/epaxos' },
           ],
         },
         {
-          text: 'Справочник',
+          text: 'Дальше',
+          collapsed: true,
           items: [
-            { text: 'Другие алгоритмы', link: '/other-algorithms' },
+            { text: 'Roadmap', link: '/roadmap' },
+            { text: 'Другие Алгоритмы', link: '/other-algorithms' },
           ],
         },
       ],
 
-      outline: { label: 'На этой странице' },
-      docFooterText: { prev: 'Назад', next: 'Далее' },
+      outline: { label: 'На этой странице', level: [2, 3] },
+      docFooter: { prev: 'Назад', next: 'Далее' },
+      lastUpdated: {
+        text: 'Обновлено',
+        formatOptions: {
+          dateStyle: 'medium',
+          timeStyle: 'short',
+        },
+      },
+      editLink: {
+        pattern: 'https://github.com/khorost/consensus-landscape/edit/main/docs/:path',
+        text: 'Предложить правку на GitHub',
+      },
+      footer: {
+        message: 'Документация проекта Consensus Landscape',
+        copyright: 'MIT License',
+      },
 
       socialLinks: [
         { icon: 'github', link: 'https://github.com/khorost/consensus-landscape' },

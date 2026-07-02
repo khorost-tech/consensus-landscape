@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useMemo, useEffect } from 'react';
 import { ClusterView } from '../visualization/ClusterView';
 import { TimelineControl } from '../visualization/TimelineControl';
 import { NodeDetail } from '../visualization/NodeDetail';
@@ -7,6 +7,9 @@ import { LatencyChart } from '../visualization/LatencyChart';
 import { useSimulation, AlgorithmType } from '../hooks/useSimulation';
 import { NodeId } from '../simulation/types';
 import { NetworkProfile, NETWORK_PROFILES } from '../simulation/constants';
+import {
+  getScenarioPresets, presetToScenario, getComparisonScenarioPreset,
+} from '../simulation/scenarios';
 
 interface SimulationPanelProps {
   id: string;
@@ -14,6 +17,9 @@ interface SimulationPanelProps {
   nodeCount: number;
   networkProfile: NetworkProfile;
   clientCount: number;
+  broadcastScenarioId?: string;
+  broadcastScenarioToken?: number;
+  broadcastClearToken?: number;
   onConfigChange?: (config: {
     algorithm: AlgorithmType;
     nodeCount: number;
@@ -28,18 +34,29 @@ export const SimulationPanel: React.FC<SimulationPanelProps> = ({
   nodeCount,
   networkProfile,
   clientCount,
+  broadcastScenarioId,
+  broadcastScenarioToken,
+  broadcastClearToken,
   onConfigChange,
 }) => {
   const [selectedNode, setSelectedNode] = useState<NodeId | null>(null);
   const [clientCmd, setClientCmd] = useState('');
+  const [selectedScenarioId, setSelectedScenarioId] = useState('');
 
   const seed = 42 + id.charCodeAt(0);
   const cfg = { algorithm: algorithmType, nodeCount, networkProfile, clientCount };
 
   const {
     state, play, pause, step, reset,
-    setSpeed, killNode, recoverNode, submitRequest,
+    setSpeed, killNode, recoverNode, submitRequest, runScenario, clearScenario,
   } = useSimulation(algorithmType, nodeCount, seed, networkProfile, clientCount);
+  const scenarioPresets = useMemo(
+    () => getScenarioPresets(algorithmType, nodeCount),
+    [algorithmType, nodeCount],
+  );
+  const effectiveSelectedScenarioId = scenarioPresets.some(preset => preset.id === selectedScenarioId)
+    ? selectedScenarioId
+    : (scenarioPresets[0]?.id ?? '');
 
   const handleNodeClick = useCallback((nodeId: NodeId) => {
     setSelectedNode(prev => prev === nodeId ? null : nodeId);
@@ -51,6 +68,25 @@ export const SimulationPanel: React.FC<SimulationPanelProps> = ({
       setClientCmd('');
     }
   }, [clientCmd, submitRequest]);
+
+  const selectedScenario = scenarioPresets.find(preset => preset.id === effectiveSelectedScenarioId) ?? null;
+
+  const handleRunScenario = useCallback(() => {
+    if (!selectedScenario) return;
+    runScenario(presetToScenario(selectedScenario, nodeCount));
+  }, [nodeCount, runScenario, selectedScenario]);
+
+  useEffect(() => {
+    if (!broadcastScenarioId || !broadcastScenarioToken) return;
+    const preset = getComparisonScenarioPreset(broadcastScenarioId, nodeCount);
+    if (!preset) return;
+    runScenario(presetToScenario(preset, nodeCount));
+  }, [broadcastScenarioId, broadcastScenarioToken, nodeCount, runScenario]);
+
+  useEffect(() => {
+    if (!broadcastClearToken) return;
+    clearScenario();
+  }, [broadcastClearToken, clearScenario]);
 
   const selectedNodeState = selectedNode ? state.nodes.get(selectedNode) ?? null : null;
 
@@ -104,7 +140,11 @@ export const SimulationPanel: React.FC<SimulationPanelProps> = ({
         <StatsBar stats={state.liveStats} algorithmName={algorithmType} />
       </div>
 
-      <LatencyChart metrics={state.metrics} currentTime={state.time} />
+      <LatencyChart
+        metrics={state.metrics}
+        scenarioMarkers={state.scenarioMarkers}
+        currentTime={state.time}
+      />
 
       <div className="panel-visualization">
         <ClusterView
@@ -132,6 +172,31 @@ export const SimulationPanel: React.FC<SimulationPanelProps> = ({
       />
 
       <div className="panel-bottom">
+        {scenarioPresets.length > 0 && (
+          <div className="scenario-runner">
+            <div className="scenario-controls">
+              <select
+                value={effectiveSelectedScenarioId}
+                onChange={e => setSelectedScenarioId(e.target.value)}
+                className="select-scenario"
+              >
+                {scenarioPresets.map(preset => (
+                  <option key={preset.id} value={preset.id}>{preset.label}</option>
+                ))}
+              </select>
+              <button onClick={handleRunScenario} className="btn btn-sm">
+                Сценарий
+              </button>
+              <button onClick={clearScenario} className="btn btn-sm">
+                Очистить
+              </button>
+            </div>
+            {selectedScenario && (
+              <p className="scenario-description">{selectedScenario.description}</p>
+            )}
+          </div>
+        )}
+
         <div className="client-input">
           <input
             type="text"

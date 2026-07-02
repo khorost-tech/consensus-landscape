@@ -1,6 +1,6 @@
 import { ConsensusAlgorithm } from './interface';
 import {
-  NodeState, NodeId, Message, Action, ClusterConfig, TimeoutType, LogEntry,
+  NodeState, NodeId, Message, Action, ClusterConfig, TimeoutType, LogEntry, ClientRequest,
 } from '../types';
 import {
   DEFAULT_ELECTION_TIMEOUT_MIN, DEFAULT_ELECTION_TIMEOUT_MAX, DEFAULT_HEARTBEAT_INTERVAL,
@@ -9,6 +9,11 @@ import {
 export class RaftAlgorithm implements ConsensusAlgorithm {
   readonly name = 'Raft';
   readonly description = 'Leader-based consensus with term-based elections and log replication';
+  private rng: () => number = Math.random;
+
+  setRandomSource(rng: () => number): void {
+    this.rng = rng;
+  }
 
   getInitialState(nodeId: NodeId, config: ClusterConfig): NodeState {
     const allNodes = Array.from({ length: config.nodeCount }, (_, i) => `node_${i}`);
@@ -19,6 +24,8 @@ export class RaftAlgorithm implements ConsensusAlgorithm {
       currentTerm: 0,
       votedFor: null,
       log: [],
+      logBaseIndex: 0,
+      logBaseTerm: 0,
       commitIndex: -1,
       lastApplied: -1,
       nextIndex: new Map(allNodes.map(id => [id, 0])),
@@ -56,6 +63,8 @@ export class RaftAlgorithm implements ConsensusAlgorithm {
       case 'request_vote_response': return this.handleRequestVoteResponse(node, msg);
       case 'append_entries': return this.handleAppendEntries(node, msg);
       case 'append_entries_response': return this.handleAppendEntriesResponse(node, msg);
+      case 'install_snapshot': return this.handleInstallSnapshot(node, msg);
+      case 'install_snapshot_response': return this.handleInstallSnapshotResponse(node, msg);
       default: return [];
     }
   }
@@ -70,7 +79,7 @@ export class RaftAlgorithm implements ConsensusAlgorithm {
     return [];
   }
 
-  onClientRequest(node: NodeState, command: string): Action[] {
+  onClientRequest(node: NodeState, request: ClientRequest): Action[] {
     if (node.role !== 'leader') {
       // Not leader — return redirect response (engine will handle re-routing)
       return [{
@@ -90,13 +99,15 @@ export class RaftAlgorithm implements ConsensusAlgorithm {
     }
 
     const entry: LogEntry = {
+      entryId: request.entryId,
+      requestId: request.requestId,
       term: node.currentTerm,
-      index: node.log.length,
-      command,
+      index: this.lastLogIndex(node) + 1,
+      command: request.command,
       committed: false,
     };
     node.log.push(entry);
-    node.matchIndex.set(node.id, node.log.length - 1);
+    node.matchIndex.set(node.id, entry.index);
 
     // Send replication and reset heartbeat timer (avoid duplicate sends)
     const actions = this.sendAppendEntriesToAll(node);
@@ -141,8 +152,8 @@ export class RaftAlgorithm implements ConsensusAlgorithm {
     const actions: Action[] = [];
 
     for (const peer of peers) {
-      const lastLogIndex = node.log.length - 1;
-      const lastLogTerm = lastLogIndex >= 0 ? node.log[lastLogIndex].term : 0;
+      const lastLogIndex = this.lastLogIndex(node);
+      const lastLogTerm = this.termAt(node, lastLogIndex) ?? 0;
 
       actions.push({
         type: 'send_message',
@@ -218,7 +229,7 @@ export class RaftAlgorithm implements ConsensusAlgorithm {
 
     const peers = node.meta.peers as NodeId[];
     for (const peer of peers) {
-      node.nextIndex.set(peer, node.log.length);
+      node.nextIndex.set(peer, this.lastLogIndex(node) + 1);
       node.matchIndex.set(peer, -1);
     }
 
@@ -252,11 +263,17 @@ export class RaftAlgorithm implements ConsensusAlgorithm {
     const actions: Action[] = [];
 
     for (const peer of peers) {
-      const nextIdx = node.nextIndex.get(peer) ?? 0;
+      const currentNext = node.nextIndex.get(peer) ?? 0;
+      if (currentNext < node.logBaseIndex) {
+        actions.push(this.sendSnapshot(node, peer));
+        continue;
+      }
+
+      const nextIdx = Math.max(currentNext, node.logBaseIndex);
+      node.nextIndex.set(peer, nextIdx);
       const prevLogIndex = nextIdx - 1;
-      const prevLogTerm = prevLogIndex >= 0 && prevLogIndex < node.log.length
-        ? node.log[prevLogIndex].term : 0;
-      const entries = heartbeatOnly ? [] : node.log.slice(nextIdx);
+      const prevLogTerm = this.termAt(node, prevLogIndex) ?? 0;
+      const entries = heartbeatOnly ? [] : this.entriesFrom(node, nextIdx);
 
       actions.push({
         type: 'send_message',
@@ -282,15 +299,15 @@ export class RaftAlgorithm implements ConsensusAlgorithm {
       node.votesReceived.clear();
       node.meta.knownLeader = leaderId; // remember who the leader is
 
-      if (prevLogIndex === -1 ||
-          (prevLogIndex < node.log.length && node.log[prevLogIndex].term === prevLogTerm)) {
+      if (prevLogIndex === -1 || this.termAt(node, prevLogIndex) === prevLogTerm) {
         success = true;
 
         let insertIdx = prevLogIndex + 1;
         for (const entry of entries) {
-          if (insertIdx < node.log.length) {
-            if (node.log[insertIdx].term !== entry.term) {
-              node.log.splice(insertIdx);
+          const existing = this.entryAt(node, insertIdx);
+          if (existing) {
+            if (existing.term !== entry.term) {
+              this.truncateFrom(node, insertIdx);
               node.log.push({ ...entry });
             }
           } else {
@@ -302,9 +319,7 @@ export class RaftAlgorithm implements ConsensusAlgorithm {
         if (leaderCommit > node.commitIndex) {
           const lastNewIndex = prevLogIndex + entries.length;
           node.commitIndex = Math.min(leaderCommit, lastNewIndex);
-          for (let i = 0; i <= node.commitIndex && i < node.log.length; i++) {
-            node.log[i].committed = true;
-          }
+          this.markCommittedThrough(node, node.commitIndex);
         }
       }
     }
@@ -315,7 +330,7 @@ export class RaftAlgorithm implements ConsensusAlgorithm {
       message: {
         type: 'append_entries_response',
         from: node.id, to: msg.from, term: node.currentTerm,
-        payload: { success, matchIndex: success ? node.log.length - 1 : -1, isHeartbeat },
+        payload: { success, matchIndex: success ? this.lastLogIndex(node) : -1, isHeartbeat },
       },
     }];
 
@@ -337,21 +352,106 @@ export class RaftAlgorithm implements ConsensusAlgorithm {
       node.matchIndex.set(msg.from, matchIndex);
       return this.tryAdvanceCommitIndex(node);
     } else {
-      const nextIdx = (node.nextIndex.get(msg.from) ?? 1) - 1;
-      node.nextIndex.set(msg.from, Math.max(0, nextIdx));
+      const currentNext = node.nextIndex.get(msg.from) ?? (this.lastLogIndex(node) + 1);
+      if (currentNext <= node.logBaseIndex) {
+        return [this.sendSnapshot(node, msg.from)];
+      }
+
+      const nextIdx = Math.max(node.logBaseIndex, currentNext - 1);
+      node.nextIndex.set(msg.from, nextIdx);
       const prevLogIndex = nextIdx - 1;
-      const prevLogTerm = prevLogIndex >= 0 && prevLogIndex < node.log.length
-        ? node.log[prevLogIndex].term : 0;
-      const entries = node.log.slice(Math.max(0, nextIdx));
+      const prevLogTerm = this.termAt(node, prevLogIndex) ?? 0;
+      const entries = this.entriesFrom(node, nextIdx);
       return [{
         type: 'send_message',
         message: {
           type: 'append_entries',
           from: node.id, to: msg.from, term: node.currentTerm,
-          payload: { leaderId: node.id, prevLogIndex: Math.max(-1, prevLogIndex), prevLogTerm, entries: entries.map(e => ({ ...e })), leaderCommit: node.commitIndex },
+          payload: {
+            leaderId: node.id,
+            prevLogIndex: Math.max(-1, prevLogIndex),
+            prevLogTerm,
+            entries: entries.map(e => ({ ...e })),
+            leaderCommit: node.commitIndex,
+          },
         },
       }];
     }
+  }
+
+  private handleInstallSnapshot(node: NodeState, msg: Message): Action[] {
+    const {
+      leaderId,
+      lastIncludedIndex,
+      lastIncludedTerm,
+    } = msg.payload as {
+      leaderId: NodeId;
+      lastIncludedIndex: number;
+      lastIncludedTerm: number;
+      leaderCommit: number;
+    };
+
+    node.role = 'follower';
+    node.votesReceived.clear();
+    node.meta.knownLeader = leaderId;
+
+    if (lastIncludedIndex >= node.logBaseIndex) {
+      node.log = node.log.filter(entry => entry.index > lastIncludedIndex);
+      node.logBaseIndex = lastIncludedIndex + 1;
+      node.logBaseTerm = lastIncludedTerm;
+      node.commitIndex = Math.max(node.commitIndex, lastIncludedIndex);
+      node.lastApplied = Math.max(node.lastApplied, lastIncludedIndex);
+    }
+
+    const actions: Action[] = [{
+      type: 'send_message',
+      message: {
+        type: 'install_snapshot_response',
+        from: node.id,
+        to: msg.from,
+        term: node.currentTerm,
+        payload: { lastIncludedIndex },
+      },
+    }];
+
+    if (msg.term >= node.currentTerm) {
+      actions.push({
+        type: 'set_timeout',
+        timeout: { type: 'election', duration: this.electionTimeout(node), nodeId: node.id },
+      });
+    }
+
+    return actions;
+  }
+
+  private handleInstallSnapshotResponse(node: NodeState, msg: Message): Action[] {
+    if (node.role !== 'leader') return [];
+    const { lastIncludedIndex } = msg.payload as { lastIncludedIndex: number };
+
+    node.matchIndex.set(msg.from, lastIncludedIndex);
+    node.nextIndex.set(msg.from, lastIncludedIndex + 1);
+
+    const nextIdx = Math.max(lastIncludedIndex + 1, node.logBaseIndex);
+    const prevLogIndex = nextIdx - 1;
+    const prevLogTerm = this.termAt(node, prevLogIndex) ?? 0;
+    const entries = this.entriesFrom(node, nextIdx);
+
+    return [{
+      type: 'send_message',
+      message: {
+        type: 'append_entries',
+        from: node.id,
+        to: msg.from,
+        term: node.currentTerm,
+        payload: {
+          leaderId: node.id,
+          prevLogIndex,
+          prevLogTerm,
+          entries: entries.map(entry => ({ ...entry })),
+          leaderCommit: node.commitIndex,
+        },
+      },
+    }];
   }
 
   private tryAdvanceCommitIndex(node: NodeState): Action[] {
@@ -359,15 +459,15 @@ export class RaftAlgorithm implements ConsensusAlgorithm {
     const totalNodes = peers.length + 1;
     const majority = Math.floor(totalNodes / 2) + 1;
 
-    for (let n = node.log.length - 1; n > node.commitIndex; n--) {
-      if (node.log[n].term !== node.currentTerm) continue;
+    for (let n = this.lastLogIndex(node); n > node.commitIndex; n--) {
+      if (this.termAt(node, n) !== node.currentTerm) continue;
       let count = 1;
       for (const peer of peers) {
         if ((node.matchIndex.get(peer) ?? -1) >= n) count++;
       }
       if (count >= majority) {
         node.commitIndex = n;
-        for (let i = 0; i <= n; i++) node.log[i].committed = true;
+        this.markCommittedThrough(node, n);
         return [{ type: 'commit_entry' }];
       }
     }
@@ -375,20 +475,70 @@ export class RaftAlgorithm implements ConsensusAlgorithm {
   }
 
   private isLogUpToDate(node: NodeState, lastLogIndex: number, lastLogTerm: number): boolean {
-    const myLastIndex = node.log.length - 1;
-    const myLastTerm = myLastIndex >= 0 ? node.log[myLastIndex].term : 0;
+    const myLastIndex = this.lastLogIndex(node);
+    const myLastTerm = this.termAt(node, myLastIndex) ?? 0;
     if (lastLogTerm !== myLastTerm) return lastLogTerm > myLastTerm;
     return lastLogIndex >= myLastIndex;
+  }
+
+  private lastLogIndex(node: NodeState): number {
+    return node.log.length > 0 ? node.log[node.log.length - 1].index : node.logBaseIndex - 1;
+  }
+
+  private entryAt(node: NodeState, index: number): LogEntry | undefined {
+    const offset = index - node.logBaseIndex;
+    return offset >= 0 && offset < node.log.length ? node.log[offset] : undefined;
+  }
+
+  private termAt(node: NodeState, index: number): number | undefined {
+    if (index === node.logBaseIndex - 1) return node.logBaseTerm;
+    return this.entryAt(node, index)?.term;
+  }
+
+  private entriesFrom(node: NodeState, startIndex: number): LogEntry[] {
+    const offset = Math.max(0, startIndex - node.logBaseIndex);
+    return node.log.slice(offset);
+  }
+
+  private truncateFrom(node: NodeState, fromIndex: number): void {
+    const offset = fromIndex - node.logBaseIndex;
+    if (offset >= 0 && offset < node.log.length) {
+      node.log.splice(offset);
+    }
+  }
+
+  private markCommittedThrough(node: NodeState, commitIndex: number): void {
+    for (const entry of node.log) {
+      if (entry.index <= commitIndex) entry.committed = true;
+    }
+  }
+
+  private sendSnapshot(node: NodeState, peer: NodeId): Action {
+    return {
+      type: 'send_message',
+      message: {
+        type: 'install_snapshot',
+        from: node.id,
+        to: peer,
+        term: node.currentTerm,
+        payload: {
+          leaderId: node.id,
+          lastIncludedIndex: node.logBaseIndex - 1,
+          lastIncludedTerm: node.logBaseTerm,
+          leaderCommit: node.commitIndex,
+        },
+      },
+    };
   }
 
   /** Election timeout from node's stored config */
   private electionTimeout(node: NodeState): number {
     const min = (node.meta.electionTimeoutMin as number) ?? DEFAULT_ELECTION_TIMEOUT_MIN;
     const max = (node.meta.electionTimeoutMax as number) ?? DEFAULT_ELECTION_TIMEOUT_MAX;
-    return min + Math.random() * (max - min);
+    return min + this.rng() * (max - min);
   }
 
   private randomElectionTimeout(config: ClusterConfig): number {
-    return config.electionTimeoutMin + Math.random() * (config.electionTimeoutMax - config.electionTimeoutMin);
+    return config.electionTimeoutMin + this.rng() * (config.electionTimeoutMax - config.electionTimeoutMin);
   }
 }

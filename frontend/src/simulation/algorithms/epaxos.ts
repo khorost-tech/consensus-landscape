@@ -1,6 +1,6 @@
 import { ConsensusAlgorithm } from './interface';
 import {
-  NodeState, NodeId, Message, Action, ClusterConfig, TimeoutType, LogEntry,
+  NodeState, NodeId, Message, Action, ClusterConfig, TimeoutType, LogEntry, ClientRequest,
 } from '../types';
 
 /**
@@ -17,14 +17,17 @@ import {
  *
  * Simplified for educational clarity:
  * - "Conflict" = two uncommitted commands from different replicas
- * - No explicit execution ordering (Tarjan's SCC omitted)
+ * - Dependency-aware materialization is simplified and uses SCC batching
  */
 
 interface Instance {
+  entryId: string;
+  requestId: string;
   command: string;
   status: 'pre-accepted' | 'accepted' | 'committed';
   seq: number;
   deps: string[];         // dependency instance IDs
+  indexHint: number | null;
   ballot: number;
   leaderNode: NodeId;
   preAcceptOks: number;
@@ -32,9 +35,20 @@ interface Instance {
   allDepsMatch: boolean;
 }
 
+const STATUS_RANK: Record<Instance['status'], number> = {
+  'pre-accepted': 0,
+  accepted: 1,
+  committed: 2,
+};
+
 export class EPaxosAlgorithm implements ConsensusAlgorithm {
   readonly name = 'EPaxos';
   readonly description = 'Egalitarian Paxos — leaderless, optimal commit latency';
+  private rng: () => number = Math.random;
+
+  setRandomSource(rng: () => number): void {
+    this.rng = rng;
+  }
 
   getInitialState(nodeId: NodeId, config: ClusterConfig): NodeState {
     const allNodes = Array.from({ length: config.nodeCount }, (_, i) => `node_${i}`);
@@ -47,6 +61,8 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
       currentTerm: 0,
       votedFor: null,
       log: [],
+      logBaseIndex: 0,
+      logBaseTerm: 0,
       commitIndex: -1,
       lastApplied: -1,
       nextIndex: new Map(),
@@ -57,7 +73,7 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
         nodeIndex,
         instanceCounter: 0,
         instances: {} as Record<string, Instance>,
-        commandQueue: [] as string[],
+        commandQueue: [] as ClientRequest[],
         maxSeq: 0,
         activeInstance: null as string | null,  // currently proposing instance key
       },
@@ -96,15 +112,15 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
         }
       }
       // Try next command if queue non-empty
-      if ((node.meta.commandQueue as string[]).length > 0) {
+      if ((node.meta.commandQueue as ClientRequest[]).length > 0) {
         return this.proposeNext(node);
       }
     }
     return [];
   }
 
-  onClientRequest(node: NodeState, command: string): Action[] {
-    (node.meta.commandQueue as string[]).push(command);
+  onClientRequest(node: NodeState, request: ClientRequest): Action[] {
+    (node.meta.commandQueue as ClientRequest[]).push(request);
 
     if (!node.meta.activeInstance) {
       return this.proposeNext(node);
@@ -121,13 +137,13 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
   // ---- Fast path: PreAccept ----
 
   private proposeNext(node: NodeState): Action[] {
-    const queue = node.meta.commandQueue as string[];
+    const queue = node.meta.commandQueue as ClientRequest[];
     if (queue.length === 0) {
       node.meta.activeInstance = null;
       return [];
     }
 
-    const command = queue.shift()!;
+    const request = queue.shift()!;
     node.meta.instanceCounter = (node.meta.instanceCounter as number) + 1;
     const instanceKey = `${node.id}:${node.meta.instanceCounter}`;
 
@@ -139,10 +155,13 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
 
     const instances = node.meta.instances as Record<string, Instance>;
     instances[instanceKey] = {
-      command,
+      entryId: request.entryId,
+      requestId: request.requestId,
+      command: request.command,
       status: 'pre-accepted',
       seq,
       deps,
+      indexHint: null,
       ballot: 0,
       leaderNode: node.id,
       preAcceptOks: 1, // self
@@ -162,7 +181,14 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
         message: {
           type: 'ep_preaccept', from: node.id, to: peer,
           term: 0,
-          payload: { instanceKey, command, seq, deps },
+          payload: {
+            instanceKey,
+            command: request.command,
+            seq,
+            deps,
+            requestId: request.requestId,
+            entryId: request.entryId,
+          },
         },
       });
     }
@@ -170,56 +196,55 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
     // Timeout for slow path fallback
     actions.push({
       type: 'set_timeout',
-      timeout: { type: 'proposal', duration: 300 + Math.random() * 200, nodeId: node.id },
+      timeout: { type: 'proposal', duration: 300 + this.rng() * 200, nodeId: node.id },
     });
 
     return actions;
   }
 
   private handlePreAccept(node: NodeState, msg: Message): Action[] {
-    const { instanceKey, command, seq, deps } = msg.payload as {
-      instanceKey: string; command: string; seq: number; deps: string[];
+    const { instanceKey, command, seq, deps, requestId, entryId } = msg.payload as {
+      instanceKey: string; command: string; seq: number; deps: string[]; requestId: string; entryId: string;
     };
-
-    // Update maxSeq
-    if (seq > (node.meta.maxSeq as number)) {
-      node.meta.maxSeq = seq;
-    }
 
     // Check for conflicts: find our own dependencies for this command
     const myDeps = this.findDependencies(node, instanceKey);
     let mySeq = seq;
 
-    // If we have a higher seq requirement, bump it
-    const maxLocalSeq = node.meta.maxSeq as number;
-    if (maxLocalSeq >= seq) {
-      mySeq = maxLocalSeq + 1;
-      node.meta.maxSeq = mySeq;
+    if (myDeps.length > 0) {
+      const instances = node.meta.instances as Record<string, Instance>;
+      const maxDepSeq = myDeps.reduce((maxSeq, depKey) => {
+        const dep = instances[depKey];
+        return dep ? Math.max(maxSeq, dep.seq) : maxSeq;
+      }, node.meta.maxSeq as number);
+      mySeq = Math.max(seq, maxDepSeq + 1);
     }
+    node.meta.maxSeq = Math.max(node.meta.maxSeq as number, mySeq);
 
-    // Store the instance
-    const instances = node.meta.instances as Record<string, Instance>;
-    instances[instanceKey] = {
+    const instance = this.upsertInstance(node, instanceKey, {
+      entryId,
+      requestId,
       command,
       status: 'pre-accepted',
       seq: mySeq,
       deps: myDeps,
+      indexHint: null,
       ballot: 0,
       leaderNode: msg.from,
       preAcceptOks: 0,
       acceptOks: 0,
       allDepsMatch: true,
-    };
+    });
 
     // Check if deps match what the leader proposed
-    const depsMatch = mySeq === seq && this.depsEqual(myDeps, deps);
+    const depsMatch = instance.seq === seq && this.depsEqual(instance.deps, deps);
 
     return [{
       type: 'send_message',
       message: {
         type: 'ep_preaccept_ok', from: node.id, to: msg.from,
         term: 0,
-        payload: { instanceKey, seq: mySeq, deps: myDeps, depsMatch },
+        payload: { instanceKey, seq: instance.seq, deps: instance.deps, depsMatch },
       },
     }];
   }
@@ -265,6 +290,7 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
   // ---- Slow path: Accept ----
 
   private startSlowPath(node: NodeState, instanceKey: string, inst: Instance): Action[] {
+    if (inst.status === 'committed') return [];
     inst.status = 'accepted';
     inst.acceptOks = 1; // self
 
@@ -277,7 +303,14 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
         message: {
           type: 'ep_accept', from: node.id, to: peer,
           term: 0,
-          payload: { instanceKey, command: inst.command, seq: inst.seq, deps: inst.deps },
+          payload: {
+            instanceKey,
+            command: inst.command,
+            seq: inst.seq,
+            deps: inst.deps,
+            requestId: inst.requestId,
+            entryId: inst.entryId,
+          },
         },
       });
     }
@@ -285,23 +318,25 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
     // New timeout for accept phase
     actions.push({
       type: 'set_timeout',
-      timeout: { type: 'proposal', duration: 400 + Math.random() * 200, nodeId: node.id },
+      timeout: { type: 'proposal', duration: 400 + this.rng() * 200, nodeId: node.id },
     });
 
     return actions;
   }
 
   private handleAccept(node: NodeState, msg: Message): Action[] {
-    const { instanceKey, command, seq, deps } = msg.payload as {
-      instanceKey: string; command: string; seq: number; deps: string[];
+    const { instanceKey, command, seq, deps, requestId, entryId } = msg.payload as {
+      instanceKey: string; command: string; seq: number; deps: string[]; requestId: string; entryId: string;
     };
 
-    const instances = node.meta.instances as Record<string, Instance>;
-    instances[instanceKey] = {
+    this.upsertInstance(node, instanceKey, {
+      entryId,
+      requestId,
       command, status: 'accepted', seq, deps,
+      indexHint: null,
       ballot: 0, leaderNode: msg.from,
       preAcceptOks: 0, acceptOks: 0, allDepsMatch: true,
-    };
+    });
 
     if (seq > (node.meta.maxSeq as number)) {
       node.meta.maxSeq = seq;
@@ -341,20 +376,12 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
     inst.status = 'committed';
     node.meta.activeInstance = null;
 
-    // Add to log
-    const alreadyCommitted = node.log.some(e => e.command === inst.command && e.committed);
     const actions: Action[] = [];
-
-    if (!alreadyCommitted) {
-      const entry: LogEntry = {
-        term: inst.seq, index: node.log.length,
-        command: inst.command, committed: true,
-      };
-      node.log.push(entry);
-      node.commitIndex = node.log.length - 1;
-      node.currentTerm = Math.max(node.currentTerm, inst.seq);
+    const materializedCount = this.materializeCommittedInstances(node);
+    if (materializedCount > 0) {
       actions.push({ type: 'commit_entry' });
     }
+    node.currentTerm = Math.max(node.currentTerm, inst.seq);
 
     // Broadcast commit to all
     const peers = node.meta.peers as NodeId[];
@@ -367,6 +394,9 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
           payload: {
             instanceKey, command: inst.command,
             seq: inst.seq, deps: inst.deps,
+            index: this.findCommittedIndex(node, instanceKey, inst.entryId) ?? inst.indexHint,
+            requestId: inst.requestId,
+            entryId: inst.entryId,
           },
         },
       });
@@ -378,7 +408,7 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
     });
 
     // Propose next command if queued
-    if ((node.meta.commandQueue as string[]).length > 0) {
+    if ((node.meta.commandQueue as ClientRequest[]).length > 0) {
       actions.push(...this.proposeNext(node));
     }
 
@@ -386,35 +416,33 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
   }
 
   private handleCommit(node: NodeState, msg: Message): Action[] {
-    const { instanceKey, command, seq, deps } = msg.payload as {
-      instanceKey: string; command: string; seq: number; deps: string[];
+    const { instanceKey, command, seq, deps, requestId, entryId, index } = msg.payload as {
+      instanceKey: string; command: string; seq: number; deps: string[]; requestId: string; entryId: string; index?: number;
     };
 
-    const instances = node.meta.instances as Record<string, Instance>;
-    instances[instanceKey] = {
+    const inst = this.upsertInstance(node, instanceKey, {
+      entryId,
+      requestId,
       command, status: 'committed', seq, deps,
+      indexHint: index ?? null,
       ballot: 0, leaderNode: msg.from,
       preAcceptOks: 0, acceptOks: 0, allDepsMatch: true,
-    };
+    });
+    inst.status = 'committed';
+    if (inst.indexHint === null && index !== undefined) {
+      inst.indexHint = index;
+    }
 
     if (seq > (node.meta.maxSeq as number)) {
       node.meta.maxSeq = seq;
     }
 
-    const alreadyCommitted = node.log.some(e => e.command === command && e.committed);
-    if (!alreadyCommitted) {
-      const entry: LogEntry = {
-        term: seq, index: node.log.length,
-        command, committed: true,
-      };
-      node.log.push(entry);
-      node.commitIndex = node.log.length - 1;
-      node.currentTerm = Math.max(node.currentTerm, seq);
-    }
+    this.materializeCommittedInstances(node);
+    node.currentTerm = Math.max(node.currentTerm, seq);
 
     // Remove from queue
-    const queue = node.meta.commandQueue as string[];
-    const idx = queue.indexOf(command);
+    const queue = node.meta.commandQueue as ClientRequest[];
+    const idx = queue.findIndex(v => v.requestId === requestId);
     if (idx !== -1) queue.splice(idx, 1);
 
     return [];
@@ -439,5 +467,193 @@ export class EPaxosAlgorithm implements ConsensusAlgorithm {
     if (a.length !== b.length) return false;
     const setA = new Set(a);
     return b.every(d => setA.has(d));
+  }
+
+  private upsertInstance(node: NodeState, instanceKey: string, patch: Instance): Instance {
+    const instances = node.meta.instances as Record<string, Instance>;
+    const existing = instances[instanceKey];
+    if (!existing) {
+      instances[instanceKey] = {
+        ...patch,
+        deps: [...patch.deps],
+      };
+      return instances[instanceKey];
+    }
+
+    existing.entryId = patch.entryId;
+    existing.requestId = patch.requestId;
+    existing.command = patch.command;
+    existing.seq = Math.max(existing.seq, patch.seq);
+    existing.indexHint = existing.indexHint ?? patch.indexHint;
+    existing.ballot = Math.max(existing.ballot, patch.ballot);
+    existing.leaderNode = patch.leaderNode;
+    existing.preAcceptOks = Math.max(existing.preAcceptOks, patch.preAcceptOks);
+    existing.acceptOks = Math.max(existing.acceptOks, patch.acceptOks);
+    existing.allDepsMatch = existing.allDepsMatch && patch.allDepsMatch;
+    const mergedDeps = new Set([...existing.deps, ...patch.deps]);
+    existing.deps = [...mergedDeps];
+    if (STATUS_RANK[patch.status] > STATUS_RANK[existing.status]) {
+      existing.status = patch.status;
+    }
+    return existing;
+  }
+
+  private upsertCommittedEntry(node: NodeState, entry: LogEntry): boolean {
+    if (entry.index < node.logBaseIndex) return false;
+
+    const existingIndex = node.log.findIndex(logEntry =>
+      logEntry.entryId === entry.entryId
+      || (entry.instanceKey !== undefined && logEntry.instanceKey === entry.instanceKey));
+
+    if (existingIndex !== -1) {
+      const existing = node.log[existingIndex];
+      const mergedEntry = {
+        ...existing,
+        ...entry,
+        committed: true,
+      };
+      if (existing.committed) {
+        node.commitIndex = Math.max(node.commitIndex, mergedEntry.index);
+        return false;
+      }
+      node.log[existingIndex] = mergedEntry;
+      node.log.sort((a, b) => a.index - b.index);
+      node.commitIndex = Math.max(node.commitIndex, mergedEntry.index);
+      return true;
+    }
+
+    node.log.push(entry);
+    node.log.sort((a, b) => a.index - b.index);
+    node.commitIndex = Math.max(node.commitIndex, entry.index);
+    return true;
+  }
+
+  private nextLogIndex(node: NodeState): number {
+    const lastIndex = node.log.length > 0 ? node.log[node.log.length - 1].index : node.logBaseIndex - 1;
+    return Math.max(node.logBaseIndex, node.commitIndex + 1, lastIndex + 1);
+  }
+
+  private findCommittedIndex(node: NodeState, instanceKey: string, entryId: string): number | null {
+    const existing = node.log.find(entry =>
+      entry.entryId === entryId
+      || (entry.instanceKey !== undefined && entry.instanceKey === instanceKey));
+    return existing?.index ?? null;
+  }
+
+  private materializeCommittedInstances(node: NodeState): number {
+    const instances = node.meta.instances as Record<string, Instance>;
+    let materializedCount = 0;
+    let progressed = true;
+
+    while (progressed) {
+      progressed = false;
+      const materialized = new Set(
+        node.log
+          .map(entry => entry.instanceKey)
+          .filter((instanceKey): instanceKey is string => instanceKey !== undefined),
+      );
+
+      const batches = this.buildReadyExecutionBatches(instances, materialized);
+
+      for (const batch of batches) {
+        for (const [instanceKey, inst] of batch) {
+          const nextIndex = this.nextLogIndex(node);
+          const targetIndex = inst.indexHint !== null && inst.indexHint >= nextIndex
+            ? inst.indexHint
+            : nextIndex;
+          const committed = this.upsertCommittedEntry(node, {
+            entryId: inst.entryId,
+            requestId: inst.requestId,
+            instanceKey,
+            term: inst.seq,
+            index: targetIndex,
+            command: inst.command,
+            committed: true,
+          });
+          if (committed) {
+            materializedCount++;
+            progressed = true;
+          }
+        }
+      }
+    }
+
+    return materializedCount;
+  }
+
+  private buildReadyExecutionBatches(
+    instances: Record<string, Instance>,
+    materialized: Set<string>,
+  ): Array<Array<[string, Instance]>> {
+    const committedPending = new Map(
+      Object.entries(instances)
+        .filter(([instanceKey, inst]) => inst.status === 'committed' && !materialized.has(instanceKey)),
+    );
+
+    if (committedPending.size === 0) return [];
+
+    const edges = new Map<string, string[]>();
+    const reverseEdges = new Map<string, string[]>();
+
+    for (const [instanceKey, inst] of committedPending) {
+      const localDeps = inst.deps.filter(dep => committedPending.has(dep));
+      edges.set(instanceKey, localDeps);
+      if (!reverseEdges.has(instanceKey)) reverseEdges.set(instanceKey, []);
+      for (const dep of localDeps) {
+        if (!reverseEdges.has(dep)) reverseEdges.set(dep, []);
+        reverseEdges.get(dep)!.push(instanceKey);
+      }
+    }
+
+    const order: string[] = [];
+    const visited = new Set<string>();
+    const dfs = (key: string): void => {
+      if (visited.has(key)) return;
+      visited.add(key);
+      for (const dep of edges.get(key) ?? []) dfs(dep);
+      order.push(key);
+    };
+
+    for (const key of committedPending.keys()) dfs(key);
+
+    const assigned = new Set<string>();
+    const batches: Array<Array<[string, Instance]>> = [];
+
+    for (let i = order.length - 1; i >= 0; i--) {
+      const root = order[i];
+      if (assigned.has(root)) continue;
+
+      const componentKeys: string[] = [];
+      const stack = [root];
+      assigned.add(root);
+
+      while (stack.length > 0) {
+        const key = stack.pop()!;
+        componentKeys.push(key);
+        for (const dep of reverseEdges.get(key) ?? []) {
+          if (!assigned.has(dep)) {
+            assigned.add(dep);
+            stack.push(dep);
+          }
+        }
+      }
+
+      const component = new Set(componentKeys);
+      const hasBlockedExternalDeps = componentKeys.some(key =>
+        (committedPending.get(key)?.deps ?? []).some(dep => !component.has(dep) && !materialized.has(dep)));
+
+      if (hasBlockedExternalDeps) continue;
+
+      const batch = componentKeys
+        .map(key => [key, committedPending.get(key)!] as [string, Instance])
+        .sort(([leftKey, left], [rightKey, right]) => left.seq - right.seq || leftKey.localeCompare(rightKey));
+      batches.push(batch);
+    }
+
+    return batches.sort((leftBatch, rightBatch) => {
+      const [leftKey, leftInst] = leftBatch[0];
+      const [rightKey, rightInst] = rightBatch[0];
+      return leftInst.seq - rightInst.seq || leftKey.localeCompare(rightKey);
+    });
   }
 }

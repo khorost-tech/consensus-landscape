@@ -1,27 +1,33 @@
 import { ConsensusAlgorithm } from './interface';
 import {
-  NodeState, NodeId, Message, Action, ClusterConfig, TimeoutType, LogEntry,
+  NodeState, NodeId, Message, Action, ClusterConfig, TimeoutType, LogEntry, ClientRequest,
 } from '../types';
 import {
   PAXOS_PROPOSAL_BASE_TIMEOUT, PAXOS_PROPOSAL_PER_NODE_INCREMENT, PAXOS_PROPOSAL_JITTER,
   PAXOS_NACK_BACKOFF_BASE, PAXOS_NACK_BACKOFF_PER_NODE, PAXOS_NACK_BACKOFF_JITTER,
 } from '../constants';
 
+interface MultiPaxosSlotState {
+  minProposal: number;
+  acceptedProposal: number;
+  acceptedValue: ClientRequest | null;
+}
+
 /**
  * Multi-Paxos — optimized Paxos with a stable leader.
  *
- * After a leader is elected via Prepare/Promise (phase 1), subsequent
- * proposals skip phase 1 entirely. The leader sends Accept directly.
- * Heartbeats maintain leadership, similar to Raft.
- *
- * Key differences from Basic Paxos visible in simulation:
- * - Stable leader (green node) with heartbeats
- * - Steady-state commits in 1 RTT (Accept/Accepted) instead of 2 RTT
- * - Falls back to full 2-phase when leadership is lost
+ * This variant is slot-based: each log index is its own Paxos instance.
+ * The elected leader reuses one ballot across multiple slots and skips
+ * Prepare after the first successful commit under that ballot.
  */
 export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
   readonly name = 'Multi-Paxos';
   readonly description = 'Paxos with stable leader — skip Prepare phase after election';
+  private rng: () => number = Math.random;
+
+  setRandomSource(rng: () => number): void {
+    this.rng = rng;
+  }
 
   getInitialState(nodeId: NodeId, config: ClusterConfig): NodeState {
     const allNodes = Array.from({ length: config.nodeCount }, (_, i) => `node_${i}`);
@@ -34,6 +40,8 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
       currentTerm: 0,
       votedFor: null,
       log: [],
+      logBaseIndex: 0,
+      logBaseTerm: 0,
       commitIndex: -1,
       lastApplied: -1,
       nextIndex: new Map(),
@@ -47,16 +55,21 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
         leaderBallot: 0,
         promisesReceived: 0,
         acceptsReceived: 0,
+        highestPromisedProposal: 0,
+        highestPromisedValue: null as ClientRequest | null,
         isElecting: false,
         knownLeader: null as NodeId | null,
-        commandQueue: [] as string[],
+        commandQueue: [] as ClientRequest[],
         proposalPhase: null as 'prepare' | 'accept' | null,
-        pendingValue: null as string | null,
-        leaderEstablished: false,  // true after first successful commit — enables Phase 1 skip
-        // Acceptor state
+        pendingValue: null as ClientRequest | null,
+        currentSlot: null as number | null,
+        nextProposalSlot: 0,
+        leaderEstablished: false,
+        slotStates: {} as Record<number, MultiPaxosSlotState>,
+        // Legacy single-slot fields kept for UI/debug display.
         minProposal: 0,
         acceptedProposal: -1,
-        acceptedValue: null as string | null,
+        acceptedValue: null as ClientRequest | null,
         heartbeatInterval: config.heartbeatInterval,
       },
     };
@@ -87,7 +100,6 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
 
   onTimeout(node: NodeState, type: TimeoutType): Action[] {
     if (type === 'election') {
-      // Election timeout — start new Prepare round to claim leadership
       return this.startElection(node);
     }
     if (type === 'heartbeat' && node.role === 'leader') {
@@ -96,20 +108,21 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
     return [];
   }
 
-  onClientRequest(node: NodeState, command: string): Action[] {
+  onClientRequest(node: NodeState, request: ClientRequest): Action[] {
     if (node.role !== 'leader') {
       return [{
         type: 'send_message',
         message: {
           type: 'client_response',
-          from: node.id, to: node.id,
+          from: node.id,
+          to: node.id,
           term: node.currentTerm,
           payload: { success: false, redirect: true, leaderHint: this.getKnownLeader(node) },
         },
       }];
     }
 
-    (node.meta.commandQueue as string[]).push(command);
+    (node.meta.commandQueue as ClientRequest[]).push(request);
 
     if (!node.meta.pendingValue) {
       return this.proposeNext(node);
@@ -124,8 +137,10 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
     node.meta.pendingValue = null;
     node.meta.promisesReceived = 0;
     node.meta.acceptsReceived = 0;
+    node.meta.currentSlot = null;
     node.meta.knownLeader = null;
     node.meta.leaderEstablished = false;
+    this.syncDisplayedAcceptorState(node, null);
 
     return [{
       type: 'set_timeout',
@@ -133,38 +148,58 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
     }];
   }
 
-  // ---- Leader election (Phase 1) ----
-
   private startElection(node: NodeState): Action[] {
     const peers = node.meta.peers as NodeId[];
     const nodeCount = peers.length + 1;
     const nodeIndex = node.meta.nodeIndex as number;
+    const slot = this.nextProposalSlot(node);
 
     node.meta.seqNum = (node.meta.seqNum as number) + 1;
     const proposalNumber = (node.meta.seqNum as number) * nodeCount + nodeIndex;
 
     node.meta.proposalNumber = proposalNumber;
+    node.meta.currentSlot = slot;
     node.currentTerm = proposalNumber;
     node.role = 'candidate';
     node.meta.isElecting = true;
     node.meta.proposalPhase = 'prepare';
-    node.meta.promisesReceived = 1; // self
+    node.meta.promisesReceived = 1;
+    node.meta.acceptsReceived = 0;
     node.meta.knownLeader = null;
     node.votesReceived.clear();
     node.votesReceived.add(node.id);
 
-    // Self-promise
-    if (proposalNumber > (node.meta.minProposal as number)) {
-      node.meta.minProposal = proposalNumber;
+    const slotState = this.getSlotState(node, slot);
+    const selfAcceptedProposal = slotState.acceptedProposal;
+    const selfAcceptedValue = slotState.acceptedValue;
+    const selfAlreadyCommitted = selfAcceptedValue !== null
+      && node.log.some(entry => entry.entryId === selfAcceptedValue.entryId && entry.committed);
+
+    if (selfAcceptedProposal > 0 && selfAcceptedValue !== null && !selfAlreadyCommitted) {
+      node.meta.highestPromisedProposal = selfAcceptedProposal;
+      node.meta.highestPromisedValue = selfAcceptedValue;
+    } else {
+      node.meta.highestPromisedProposal = 0;
+      node.meta.highestPromisedValue = null;
     }
+
+    const promised = this.getPromisedProposal(node, slot);
+    if (proposalNumber > promised) {
+      node.meta.minProposal = proposalNumber;
+      slotState.minProposal = proposalNumber;
+    }
+    this.syncDisplayedAcceptorState(node, slot);
 
     const actions: Action[] = [];
     for (const peer of peers) {
       actions.push({
         type: 'send_message',
         message: {
-          type: 'prepare', from: node.id, to: peer, term: proposalNumber,
-          payload: { proposalNumber },
+          type: 'prepare',
+          from: node.id,
+          to: peer,
+          term: proposalNumber,
+          payload: { proposalNumber, slot },
         },
       });
     }
@@ -172,31 +207,48 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
     const baseDuration = PAXOS_PROPOSAL_BASE_TIMEOUT + nodeIndex * PAXOS_PROPOSAL_PER_NODE_INCREMENT;
     actions.push({
       type: 'set_timeout',
-      timeout: { type: 'election', duration: baseDuration + Math.random() * PAXOS_PROPOSAL_JITTER, nodeId: node.id },
+      timeout: {
+        type: 'election',
+        duration: baseDuration + this.rng() * PAXOS_PROPOSAL_JITTER,
+        nodeId: node.id,
+      },
     });
 
     return actions;
   }
 
   private handlePrepare(node: NodeState, msg: Message): Action[] {
-    const { proposalNumber } = msg.payload as { proposalNumber: number };
+    const { proposalNumber, slot } = msg.payload as { proposalNumber: number; slot: number };
+    const slotState = this.getSlotState(node, slot);
+    const promised = this.getPromisedProposal(node, slot);
 
-    if (proposalNumber > (node.meta.minProposal as number)) {
+    if (proposalNumber > promised) {
       node.meta.minProposal = proposalNumber;
-      // Step down if we were leader with lower ballot
+      slotState.minProposal = proposalNumber;
+
       if (node.role === 'leader' && proposalNumber > (node.meta.leaderBallot as number)) {
         node.role = 'follower';
         node.meta.knownLeader = null;
+        node.meta.pendingValue = null;
+        node.meta.proposalPhase = null;
+        node.meta.currentSlot = null;
+        node.meta.leaderEstablished = false;
       }
+
+      this.syncDisplayedAcceptorState(node, slot);
 
       return [{
         type: 'send_message',
         message: {
-          type: 'promise', from: node.id, to: msg.from, term: proposalNumber,
+          type: 'promise',
+          from: node.id,
+          to: msg.from,
+          term: proposalNumber,
           payload: {
             proposalNumber,
-            acceptedProposal: node.meta.acceptedProposal,
-            acceptedValue: node.meta.acceptedValue,
+            slot,
+            acceptedProposal: slotState.acceptedProposal,
+            acceptedValue: slotState.acceptedValue,
           },
         },
       }];
@@ -205,8 +257,11 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
     return [{
       type: 'send_message',
       message: {
-        type: 'nack', from: node.id, to: msg.from, term: node.meta.minProposal as number,
-        payload: { proposalNumber, highestSeen: node.meta.minProposal },
+        type: 'nack',
+        from: node.id,
+        to: msg.from,
+        term: promised,
+        payload: { proposalNumber, slot, highestSeen: promised },
       },
     }];
   }
@@ -214,40 +269,39 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
   private handlePromise(node: NodeState, msg: Message): Action[] {
     if (node.meta.proposalPhase !== 'prepare') return [];
 
-    const { proposalNumber, acceptedProposal, acceptedValue } = msg.payload as {
-      proposalNumber: number; acceptedProposal: number; acceptedValue: string | null;
+    const { proposalNumber, slot, acceptedProposal, acceptedValue } = msg.payload as {
+      proposalNumber: number;
+      slot: number;
+      acceptedProposal: number;
+      acceptedValue: ClientRequest | null;
     };
 
-    // During election: check against proposalNumber; as leader: check against leaderBallot
     const expectedBallot = node.meta.isElecting
       ? node.meta.proposalNumber as number
       : node.meta.leaderBallot as number;
-    if (proposalNumber !== expectedBallot) return [];
+    if (proposalNumber !== expectedBallot || slot !== node.meta.currentSlot) return [];
 
     node.votesReceived.add(msg.from);
     node.meta.promisesReceived = (node.meta.promisesReceived as number) + 1;
 
-    // Adopt highest accepted value (skip already committed)
-    if (acceptedProposal > (node.meta.acceptedProposal as number) && acceptedValue !== null) {
-      const alreadyCommitted = node.log.some(e => e.command === acceptedValue && e.committed);
+    if (acceptedProposal > (node.meta.highestPromisedProposal as number) && acceptedValue !== null) {
+      const alreadyCommitted = node.log.some(entry => entry.entryId === acceptedValue.entryId && entry.committed);
       if (!alreadyCommitted) {
-        node.meta.acceptedProposal = acceptedProposal;
-        node.meta.acceptedValue = acceptedValue;
+        node.meta.highestPromisedProposal = acceptedProposal;
+        node.meta.highestPromisedValue = acceptedValue;
       }
     }
 
     const peers = node.meta.peers as NodeId[];
     const majority = Math.floor((peers.length + 1) / 2) + 1;
 
-    if ((node.meta.promisesReceived as number) >= majority) {
-      if (node.meta.isElecting) {
-        // Election complete — become leader
-        return this.becomeLeader(node);
-      }
-      // Leader's confirmation Prepare done — now send Accept (Phase 2)
-      return this.sendAcceptForPending(node);
+    if ((node.meta.promisesReceived as number) < majority) return [];
+
+    if (node.meta.isElecting) {
+      return this.becomeLeader(node);
     }
-    return [];
+
+    return this.sendAcceptForPending(node);
   }
 
   private becomeLeader(node: NodeState): Action[] {
@@ -255,108 +309,137 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
     node.meta.isElecting = false;
     node.meta.proposalPhase = null;
     node.meta.leaderBallot = node.meta.proposalNumber;
-    node.meta.leaderEstablished = false; // first proposal will use full 2-phase
+    node.meta.leaderEstablished = false;
     node.meta.knownLeader = node.id;
+    node.meta.currentSlot = null;
+    this.syncDisplayedAcceptorState(node, null);
 
     const actions: Action[] = [
       { type: 'cancel_timeout', timeout: { type: 'election', duration: 0, nodeId: node.id } },
-      { type: 'set_timeout', timeout: { type: 'heartbeat', duration: (node.meta.heartbeatInterval as number), nodeId: node.id } },
     ];
 
-    // Send initial heartbeats
     actions.push(...this.sendHeartbeats(node));
 
-    // If we had adopted an accepted value, propose it now
-    const adoptedValue = node.meta.acceptedValue as string | null;
+    const adoptedValue = node.meta.highestPromisedValue as ClientRequest | null;
     if (adoptedValue !== null) {
-      const alreadyCommitted = node.log.some(e => e.command === adoptedValue && e.committed);
+      const alreadyCommitted = node.log.some(entry => entry.entryId === adoptedValue.entryId && entry.committed);
       if (!alreadyCommitted) {
-        (node.meta.commandQueue as string[]).unshift(adoptedValue);
+        const queue = node.meta.commandQueue as ClientRequest[];
+        if (!queue.some(request => request.requestId === adoptedValue.requestId)) {
+          queue.unshift(adoptedValue);
+        }
       }
-      node.meta.acceptedProposal = -1;
-      node.meta.acceptedValue = null;
     }
+    node.meta.highestPromisedProposal = 0;
+    node.meta.highestPromisedValue = null;
 
-    // Start proposing if we have queued commands
-    if ((node.meta.commandQueue as string[]).length > 0) {
+    if ((node.meta.commandQueue as ClientRequest[]).length > 0) {
       actions.push(...this.proposeNext(node));
     }
 
     return actions;
   }
 
-  // ---- Steady-state: skip Phase 1, go directly to Accept ----
-
   private proposeNext(node: NodeState): Action[] {
-    const queue = node.meta.commandQueue as string[];
+    const queue = node.meta.commandQueue as ClientRequest[];
     if (queue.length === 0 || node.role !== 'leader') {
       node.meta.pendingValue = null;
+      node.meta.currentSlot = null;
       return [];
     }
 
+    const slot = Math.max(
+      (node.meta.currentSlot as number | null) ?? -1,
+      this.nextProposalSlot(node),
+    );
     const value = queue[0];
     node.meta.pendingValue = value;
+    node.meta.currentSlot = slot;
 
     const ballot = node.meta.leaderBallot as number;
     const peers = node.meta.peers as NodeId[];
     const actions: Action[] = [];
 
     if (!node.meta.leaderEstablished) {
-      // Full 2-phase Paxos: Prepare first, then Accept after majority Promise
-      // This happens on the FIRST proposal after (re-)election
       node.meta.proposalPhase = 'prepare';
-      node.meta.promisesReceived = 1; // self-promise
+      node.meta.promisesReceived = 1;
+      node.meta.acceptsReceived = 0;
+
+      const slotState = this.getSlotState(node, slot);
+      const selfAcceptedProposal = slotState.acceptedProposal;
+      const selfAcceptedValue = slotState.acceptedValue;
+      const selfAlreadyCommitted = selfAcceptedValue !== null
+        && node.log.some(entry => entry.entryId === selfAcceptedValue.entryId && entry.committed);
+
+      if (selfAcceptedProposal > 0 && selfAcceptedValue !== null && !selfAlreadyCommitted) {
+        node.meta.highestPromisedProposal = selfAcceptedProposal;
+        node.meta.highestPromisedValue = selfAcceptedValue;
+      } else {
+        node.meta.highestPromisedProposal = 0;
+        node.meta.highestPromisedValue = null;
+      }
+
+      const promised = this.getPromisedProposal(node, slot);
+      if (ballot > promised) {
+        node.meta.minProposal = ballot;
+        slotState.minProposal = ballot;
+      }
+      this.syncDisplayedAcceptorState(node, slot);
 
       for (const peer of peers) {
         actions.push({
           type: 'send_message',
           message: {
-            type: 'prepare', from: node.id, to: peer, term: ballot,
-            payload: { proposalNumber: ballot },
+            type: 'prepare',
+            from: node.id,
+            to: peer,
+            term: ballot,
+            payload: { proposalNumber: ballot, slot },
           },
         });
       }
       return actions;
     }
 
-    // Optimized path: skip Phase 1, send Accept directly (leader already established)
-    node.meta.proposalPhase = 'accept';
-    node.meta.acceptsReceived = 1; // self-accept
-    node.meta.acceptedProposal = ballot;
-    node.meta.acceptedValue = value;
-
-    for (const peer of peers) {
-      actions.push({
-        type: 'send_message',
-        message: {
-          type: 'accept', from: node.id, to: peer, term: ballot,
-          payload: { proposalNumber: ballot, value },
-        },
-      });
-    }
-    return actions;
+    return this.sendAccept(node, slot, value);
   }
 
-  /** Phase 2 after leader's confirmation Prepare got majority — send Accept with pending value */
   private sendAcceptForPending(node: NodeState): Action[] {
-    const value = node.meta.pendingValue as string | null;
-    if (!value || node.role !== 'leader') return [];
+    const value = node.meta.pendingValue as ClientRequest | null;
+    const slot = node.meta.currentSlot as number | null;
+    if (!value || node.role !== 'leader' || slot === null) return [];
 
+    const adoptedValue = node.meta.highestPromisedValue as ClientRequest | null;
+    const valueToAccept = adoptedValue ?? value;
+    node.meta.highestPromisedProposal = 0;
+    node.meta.highestPromisedValue = null;
+
+    return this.sendAccept(node, slot, valueToAccept);
+  }
+
+  private sendAccept(node: NodeState, slot: number, value: ClientRequest): Action[] {
     node.meta.proposalPhase = 'accept';
-    node.meta.acceptsReceived = 1; // self-accept
+    node.meta.acceptsReceived = 1;
 
     const ballot = node.meta.leaderBallot as number;
-    node.meta.acceptedProposal = ballot;
-    node.meta.acceptedValue = value;
-
     const peers = node.meta.peers as NodeId[];
+    const slotState = this.getSlotState(node, slot);
+    slotState.minProposal = Math.max(slotState.minProposal, ballot);
+    slotState.acceptedProposal = ballot;
+    slotState.acceptedValue = value;
+    node.meta.minProposal = Math.max(node.meta.minProposal as number, ballot);
+    this.syncDisplayedAcceptorState(node, slot);
+
     const actions: Action[] = [];
     for (const peer of peers) {
       actions.push({
         type: 'send_message',
         message: {
-          type: 'accept', from: node.id, to: peer, term: ballot,
-          payload: { proposalNumber: ballot, value },
+          type: 'accept',
+          from: node.id,
+          to: peer,
+          term: ballot,
+          payload: { proposalNumber: ballot, slot, value },
         },
       });
     }
@@ -364,14 +447,21 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
   }
 
   private handleAccept(node: NodeState, msg: Message): Action[] {
-    const { proposalNumber, value } = msg.payload as { proposalNumber: number; value: string };
+    const { proposalNumber, slot, value } = msg.payload as {
+      proposalNumber: number;
+      slot: number;
+      value: ClientRequest;
+    };
+    const slotState = this.getSlotState(node, slot);
+    const promised = this.getPromisedProposal(node, slot);
 
-    if (proposalNumber >= (node.meta.minProposal as number)) {
+    if (proposalNumber >= promised) {
       node.meta.minProposal = proposalNumber;
-      node.meta.acceptedProposal = proposalNumber;
-      node.meta.acceptedValue = value;
+      slotState.minProposal = proposalNumber;
+      slotState.acceptedProposal = proposalNumber;
+      slotState.acceptedValue = value;
+      this.syncDisplayedAcceptorState(node, slot);
 
-      // Recognize sender as leader
       if (node.role !== 'leader') {
         node.role = 'follower';
         node.meta.knownLeader = msg.from;
@@ -380,8 +470,11 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
       return [{
         type: 'send_message',
         message: {
-          type: 'accepted', from: node.id, to: msg.from, term: proposalNumber,
-          payload: { proposalNumber, value },
+          type: 'accepted',
+          from: node.id,
+          to: msg.from,
+          term: proposalNumber,
+          payload: { proposalNumber, slot, value },
         },
       }];
     }
@@ -389,8 +482,11 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
     return [{
       type: 'send_message',
       message: {
-        type: 'nack', from: node.id, to: msg.from, term: node.meta.minProposal as number,
-        payload: { proposalNumber, highestSeen: node.meta.minProposal },
+        type: 'nack',
+        from: node.id,
+        to: msg.from,
+        term: promised,
+        payload: { proposalNumber, slot, highestSeen: promised },
       },
     }];
   }
@@ -398,94 +494,104 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
   private handleAccepted(node: NodeState, msg: Message): Action[] {
     if (node.role !== 'leader') return [];
 
-    const { proposalNumber, value } = msg.payload as { proposalNumber: number; value: string };
-    if (proposalNumber !== node.meta.leaderBallot) return [];
+    const { proposalNumber, slot, value } = msg.payload as {
+      proposalNumber: number;
+      slot: number;
+      value: ClientRequest;
+    };
+    if (proposalNumber !== node.meta.leaderBallot || slot !== node.meta.currentSlot) return [];
 
     node.meta.acceptsReceived = (node.meta.acceptsReceived as number) + 1;
 
     const peers = node.meta.peers as NodeId[];
     const majority = Math.floor((peers.length + 1) / 2) + 1;
 
-    if ((node.meta.acceptsReceived as number) >= majority) {
-      node.meta.acceptsReceived = 0;
+    if ((node.meta.acceptsReceived as number) < majority) return [];
 
-      const alreadyCommitted = node.log.some(e => e.command === value && e.committed);
-      const queue = node.meta.commandQueue as string[];
-      const idx = queue.indexOf(value);
-      if (idx !== -1) queue.splice(idx, 1);
+    node.meta.acceptsReceived = 0;
 
-      node.meta.pendingValue = null;
-      node.meta.proposalPhase = null;
-      node.meta.acceptedProposal = -1;
-      node.meta.acceptedValue = null;
-      node.meta.leaderEstablished = true; // subsequent proposals skip Phase 1
+    const queue = node.meta.commandQueue as ClientRequest[];
+    const idx = queue.findIndex(request => request.requestId === value.requestId);
+    if (idx !== -1) queue.splice(idx, 1);
 
-      const actions: Action[] = [];
+    node.meta.pendingValue = null;
+    node.meta.proposalPhase = null;
+    node.meta.currentSlot = null;
+    node.meta.nextProposalSlot = Math.max(node.meta.nextProposalSlot as number, slot + 1);
+    node.meta.leaderEstablished = true;
+    this.syncDisplayedAcceptorState(node, null);
 
-      if (!alreadyCommitted) {
-        const entry: LogEntry = {
-          term: proposalNumber, index: node.log.length,
-          command: value, committed: true,
-        };
-        node.log.push(entry);
-        node.commitIndex = node.log.length - 1;
-        actions.push({ type: 'commit_entry' });
+    const actions: Action[] = [];
+    const committed = this.upsertCommittedEntry(node, slot, value, proposalNumber);
+    if (committed) {
+      actions.push({ type: 'commit_entry' });
 
-        for (const peer of peers) {
-          actions.push({
-            type: 'send_message',
-            message: {
-              type: 'learn', from: node.id, to: peer, term: proposalNumber,
-              payload: { value, proposalNumber, commitIndex: node.commitIndex },
-            },
-          });
-        }
+      for (const peer of peers) {
+        actions.push({
+          type: 'send_message',
+          message: {
+            type: 'learn',
+            from: node.id,
+            to: peer,
+            term: proposalNumber,
+            payload: { slot, value, proposalNumber, commitIndex: slot },
+          },
+        });
       }
-
-      // Propose next command
-      if (queue.length > 0) {
-        actions.push(...this.proposeNext(node));
-      }
-
-      return actions;
     }
-    return [];
+
+    if (queue.length > 0) {
+      actions.push(...this.proposeNext(node));
+    }
+
+    return actions;
   }
 
   private handleNack(node: NodeState, msg: Message): Action[] {
-    const { proposalNumber, highestSeen } = msg.payload as { proposalNumber: number; highestSeen: number };
+    const { proposalNumber, highestSeen } = msg.payload as {
+      proposalNumber: number;
+      slot?: number;
+      highestSeen: number;
+    };
 
-    // If we're leader and our ballot got rejected, step down
     if (node.role === 'leader' && proposalNumber === node.meta.leaderBallot) {
       node.role = 'follower';
       node.meta.knownLeader = null;
       node.meta.pendingValue = null;
       node.meta.proposalPhase = null;
+      node.meta.currentSlot = null;
+      node.meta.leaderEstablished = false;
+      this.syncDisplayedAcceptorState(node, null);
 
       const nodeCount = (node.meta.peers as NodeId[]).length + 1;
       const nodeIndex = node.meta.nodeIndex as number;
-      const minSeq = Math.ceil(((highestSeen as number) - nodeIndex) / nodeCount) + 1;
+      const minSeq = Math.ceil((highestSeen - nodeIndex) / nodeCount) + 1;
       if (minSeq > (node.meta.seqNum as number)) node.meta.seqNum = minSeq;
 
-      const backoff = PAXOS_NACK_BACKOFF_BASE + nodeIndex * PAXOS_NACK_BACKOFF_PER_NODE + Math.random() * PAXOS_NACK_BACKOFF_JITTER;
+      const backoff = PAXOS_NACK_BACKOFF_BASE
+        + nodeIndex * PAXOS_NACK_BACKOFF_PER_NODE
+        + this.rng() * PAXOS_NACK_BACKOFF_JITTER;
       return [
         { type: 'cancel_timeout', timeout: { type: 'heartbeat', duration: 0, nodeId: node.id } },
         { type: 'set_timeout', timeout: { type: 'election', duration: backoff, nodeId: node.id } },
       ];
     }
 
-    // If we're electing and got nacked
     if (node.meta.isElecting && proposalNumber === node.meta.proposalNumber) {
       node.meta.isElecting = false;
       node.meta.proposalPhase = null;
+      node.meta.currentSlot = null;
       node.role = 'follower';
+      this.syncDisplayedAcceptorState(node, null);
 
       const nodeCount = (node.meta.peers as NodeId[]).length + 1;
       const nodeIndex = node.meta.nodeIndex as number;
-      const minSeq = Math.ceil(((highestSeen as number) - nodeIndex) / nodeCount) + 1;
+      const minSeq = Math.ceil((highestSeen - nodeIndex) / nodeCount) + 1;
       if (minSeq > (node.meta.seqNum as number)) node.meta.seqNum = minSeq;
 
-      const backoff = PAXOS_NACK_BACKOFF_BASE + nodeIndex * PAXOS_NACK_BACKOFF_PER_NODE + Math.random() * PAXOS_NACK_BACKOFF_JITTER;
+      const backoff = PAXOS_NACK_BACKOFF_BASE
+        + nodeIndex * PAXOS_NACK_BACKOFF_PER_NODE
+        + this.rng() * PAXOS_NACK_BACKOFF_JITTER;
       return [{ type: 'set_timeout', timeout: { type: 'election', duration: backoff, nodeId: node.id } }];
     }
 
@@ -493,30 +599,38 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
   }
 
   private handleLearn(node: NodeState, msg: Message): Action[] {
-    const { value, proposalNumber } = msg.payload as { value: string; proposalNumber: number };
+    const { slot, value, proposalNumber } = msg.payload as {
+      slot?: number;
+      value: ClientRequest;
+      proposalNumber: number;
+      commitIndex?: number;
+    };
+    const learnedSlot = slot ?? (msg.payload.commitIndex as number);
 
-    const alreadyCommitted = node.log.some(e => e.command === value && e.committed);
-    if (!alreadyCommitted) {
-      const entry: LogEntry = {
-        term: proposalNumber, index: node.log.length,
-        command: value, committed: true,
-      };
-      node.log.push(entry);
-      node.commitIndex = node.log.length - 1;
-    }
+    const committed = this.upsertCommittedEntry(node, learnedSlot, value, proposalNumber);
+    void committed;
+    node.meta.nextProposalSlot = Math.max(node.meta.nextProposalSlot as number, learnedSlot + 1);
+    this.syncDisplayedAcceptorState(node, null);
 
-    node.meta.acceptedProposal = -1;
-    node.meta.acceptedValue = null;
-
-    // Remove from queue
-    const queue = node.meta.commandQueue as string[];
-    const idx = queue.indexOf(value);
+    const queue = node.meta.commandQueue as ClientRequest[];
+    const idx = queue.findIndex(request => request.requestId === value.requestId);
     if (idx !== -1) queue.splice(idx, 1);
+
+    if ((node.meta.currentSlot as number | null) === learnedSlot) {
+      node.meta.pendingValue = null;
+      node.meta.proposalPhase = null;
+      node.meta.currentSlot = null;
+
+      if (node.role === 'leader') {
+        node.meta.leaderEstablished = true;
+        if (queue.length > 0) {
+          return this.proposeNext(node);
+        }
+      }
+    }
 
     return [];
   }
-
-  // ---- Heartbeats ----
 
   private sendHeartbeats(node: NodeState): Action[] {
     const peers = node.meta.peers as NodeId[];
@@ -525,7 +639,9 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
       actions.push({
         type: 'send_message',
         message: {
-          type: 'mp_heartbeat', from: node.id, to: peer,
+          type: 'mp_heartbeat',
+          from: node.id,
+          to: peer,
           term: node.meta.leaderBallot as number,
           payload: { leaderBallot: node.meta.leaderBallot, commitIndex: node.commitIndex },
         },
@@ -533,7 +649,7 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
     }
     actions.push({
       type: 'set_timeout',
-      timeout: { type: 'heartbeat', duration: (node.meta.heartbeatInterval as number), nodeId: node.id },
+      timeout: { type: 'heartbeat', duration: node.meta.heartbeatInterval as number, nodeId: node.id },
     });
     return actions;
   }
@@ -544,19 +660,25 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
     if (leaderBallot >= (node.meta.minProposal as number)) {
       node.meta.minProposal = leaderBallot;
       node.meta.knownLeader = msg.from;
-      if (node.role !== 'leader') {
+      node.meta.isElecting = false;
+      if (node.role !== 'leader' || msg.from !== node.id) {
         node.role = 'follower';
-        node.meta.isElecting = false;
         node.meta.proposalPhase = null;
+        node.meta.pendingValue = null;
+        node.meta.currentSlot = null;
+        node.meta.leaderEstablished = false;
       }
 
       return [
-        { type: 'set_timeout', timeout: { type: 'election', duration: 300 + Math.random() * 300, nodeId: node.id } },
+        { type: 'set_timeout', timeout: { type: 'election', duration: 300 + this.rng() * 300, nodeId: node.id } },
         {
           type: 'send_message',
           message: {
-            type: 'mp_heartbeat_response', from: node.id, to: msg.from,
-            term: leaderBallot, payload: {},
+            type: 'mp_heartbeat_response',
+            from: node.id,
+            to: msg.from,
+            term: leaderBallot,
+            payload: {},
           },
         },
       ];
@@ -564,7 +686,74 @@ export class MultiPaxosAlgorithm implements ConsensusAlgorithm {
     return [];
   }
 
+  private getSlotState(node: NodeState, slot: number): MultiPaxosSlotState {
+    const slotStates = node.meta.slotStates as Record<number, MultiPaxosSlotState>;
+    if (!slotStates[slot]) {
+      slotStates[slot] = {
+        minProposal: node.meta.minProposal as number,
+        acceptedProposal: -1,
+        acceptedValue: null,
+      };
+    }
+    return slotStates[slot];
+  }
+
+  private getPromisedProposal(node: NodeState, slot: number): number {
+    const slotState = this.getSlotState(node, slot);
+    return Math.max(node.meta.minProposal as number, slotState.minProposal);
+  }
+
+  private syncDisplayedAcceptorState(node: NodeState, slot: number | null): void {
+    if (slot === null) {
+      node.meta.acceptedProposal = -1;
+      node.meta.acceptedValue = null;
+      return;
+    }
+
+    const slotState = this.getSlotState(node, slot);
+    node.meta.minProposal = Math.max(node.meta.minProposal as number, slotState.minProposal);
+    node.meta.acceptedProposal = slotState.acceptedProposal;
+    node.meta.acceptedValue = slotState.acceptedValue;
+  }
+
+  private nextProposalSlot(node: NodeState): number {
+    return Math.max(
+      node.meta.nextProposalSlot as number,
+      node.commitIndex + 1,
+      node.logBaseIndex,
+    );
+  }
+
+  private upsertCommittedEntry(node: NodeState, slot: number, value: ClientRequest, proposalNumber: number): boolean {
+    if (slot < node.logBaseIndex) return false;
+
+    const entry: LogEntry = {
+      entryId: value.entryId,
+      requestId: value.requestId,
+      term: proposalNumber,
+      index: slot,
+      command: value.command,
+      committed: true,
+    };
+
+    const existingIndex = node.log.findIndex(logEntry => logEntry.index === slot);
+    if (existingIndex !== -1) {
+      const existing = node.log[existingIndex];
+      if (existing.entryId === value.entryId && existing.committed) {
+        node.commitIndex = Math.max(node.commitIndex, slot);
+        return false;
+      }
+      node.log[existingIndex] = entry;
+    } else {
+      node.log.push(entry);
+      node.log.sort((a, b) => a.index - b.index);
+    }
+
+    node.commitIndex = Math.max(node.commitIndex, slot);
+    return true;
+  }
+
   private randomTimeout(config: ClusterConfig): number {
-    return config.electionTimeoutMin + Math.random() * (config.electionTimeoutMax - config.electionTimeoutMin);
+    return config.electionTimeoutMin + this.rng() * (config.electionTimeoutMax - config.electionTimeoutMin);
   }
 }

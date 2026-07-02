@@ -1,0 +1,42 @@
+name: Build image (k8s)
+
+# Собирает статический образ (симулятор + документация) и пушит в Nexus.
+# ArgoCD (репо khorost-argocd, chart consensus-landscape) подхватывает digest
+# через argocd-image-updater. Отдельно от deploy.yml (GitHub Pages).
+#
+# Теги: develop → :latest, main → :stable, v* → версия — как в khorost.tech.
+# Требует org-секреты NEXUS_URL / NEXUS_USERNAME / NEXUS_PASSWORD и self-hosted
+# runner, доступные репозиторию в организации khorost-tech.
+
+on:
+  push:
+    branches: [main, develop]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: [self-hosted, Linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            echo "tag=stable" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build & push image
+        run: |
+          TAG=${{ steps.meta.outputs.tag }}
+          # Путь образа = NEXUS_URL/<owner>/<repo> (как в geoip): github.repository
+          # даёт khorost-tech/consensus-landscape, итог images.khorost.tech/khorost-tech/consensus-landscape
+          # — namespace из контекста, совпадает с ArgoCD-чартом.
+          IMAGE="${{ secrets.NEXUS_URL }}/${{ github.repository }}:$TAG"
+          echo "${{ secrets.NEXUS_PASSWORD }}" | docker login "${{ secrets.NEXUS_URL }}" -u "${{ secrets.NEXUS_USERNAME }}" --password-stdin
+          docker build -f Dockerfile -t "$IMAGE" .
+          docker push "$IMAGE"

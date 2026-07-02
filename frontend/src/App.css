@@ -159,6 +159,34 @@ body {
   align-items: center;
 }
 
+.header-scenarios {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.header-scenarios-hint {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.header-scenarios-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.header-scenarios-legend {
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.header-select {
+  min-width: 180px;
+}
+
 /* ===== Panels ===== */
 .panels-container {
   flex: 1;
@@ -215,7 +243,8 @@ body {
 .select-algorithm,
 .select-nodes,
 .select-profile,
-.select-clients {
+.select-clients,
+.select-scenario {
   padding: 4px 8px;
   border-radius: 6px;
   border: 1px solid var(--border-color);
@@ -425,6 +454,25 @@ body {
   flex-shrink: 0;
 }
 
+.scenario-runner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.scenario-controls {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.scenario-description {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .client-input {
   display: flex;
   gap: 6px;
@@ -520,7 +568,12 @@ body {
   margin-top: 6px;
 }
 
-.node-log h5 {
+.node-detail-section {
+  margin-top: 8px;
+}
+
+.node-log h5,
+.node-detail-section h5 {
   font-size: 11px;
   color: var(--text-secondary);
   margin-bottom: 4px;
@@ -534,7 +587,8 @@ body {
 
 .log-entry {
   display: flex;
-  gap: 6px;
+  flex-direction: column;
+  gap: 2px;
   padding: 2px 6px;
   border-radius: 3px;
   font-size: 11px;
@@ -543,10 +597,23 @@ body {
 
 .log-entry.committed { background: var(--committed-bg); }
 .log-entry.pending { background: var(--pending-bg); }
+.log-entry.applied { outline: 1px solid var(--node-leader-stroke); }
+
+.log-entry-main {
+  display: flex;
+  gap: 6px;
+}
 
 .log-index { color: var(--text-muted); min-width: 20px; }
 .log-term { color: var(--text-secondary); min-width: 24px; }
 .log-command { flex: 1; }
+.log-entry-meta {
+  color: var(--text-muted);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ===== Buttons ===== */
 .btn {
