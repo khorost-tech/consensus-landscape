@@ -4,11 +4,11 @@
 
 ## Обзор
 
-Zab — протокол atomic broadcast, разработанный для Apache ZooKeeper (2011). Обеспечивает **total order broadcast** — все узлы видят сообщения в одинаковом порядке. Разработан независимо от Raft, но имеет похожую leader-based архитектуру.
+Zab — протокол atomic broadcast, разработанный для Apache ZooKeeper (2011). Обеспечивает **total order broadcast** — все узлы видят сообщения в одинаковом порядке. Разработан независимо от Raft, но имеет похожую архитектуру с лидером.
 
 **Ключевые особенности:**
 - Три явные фазы: Election → Synchronization → Broadcast
-- Epoch-based версионирование (аналог term в Raft)
+- Версионирование по `epoch` (аналог `term` в Raft)
 - Гарантия FIFO-порядка при смене лидеров (causal order)
 - Трёхшаговый коммит: Proposal → Ack → Commit
 
@@ -122,7 +122,7 @@ sequenceDiagram
 
 ## Heartbeats
 
-Лидер рассылает heartbeats для поддержания лидерства. При пропуске heartbeat follower переходит в Looking и начинает новые выборы.
+Лидер рассылает `heartbeat`-сообщения для поддержания лидерства. При пропуске `heartbeat` follower переходит в `Looking` и начинает новые выборы.
 
 ## Обработка отказов
 
@@ -139,7 +139,7 @@ sequenceDiagram
 
 ## Zxid: двумерная версия
 
-Вместо одномерного term/ballot, Zab использует двумерный идентификатор транзакции:
+Вместо одномерного `term`/`ballot` Zab использует двумерный идентификатор транзакции:
 
 ```
 zxid = (epoch, counter)
@@ -158,6 +158,8 @@ zxid = (epoch, counter)
 | Quorum | Configurable (возможны weighted quorums) | Простое большинство |
 | Learner (Observer) | Не голосующие read-only узлы | Не реализованы |
 | FIFO guarantees | TCP гарантирует FIFO между парами | Симуляция не моделирует FIFO per-pair |
+| Commit mapping | Commit привязан к конкретному `zxid` и transaction log | Учебная модель с explicit `zxid`, sync и commit по идентичности записи |
+| PRNG | Не специфицирован | Внутренние таймауты выборов используют seeded RNG |
 
 ## Источники
 

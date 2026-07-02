@@ -1,8 +1,11 @@
-import { NodeState, Message, Action, ClusterConfig, TimeoutType, NodeId } from '../types';
+import { NodeState, Message, Action, ClusterConfig, TimeoutType, NodeId, ClientRequest } from '../types';
 
 export interface ConsensusAlgorithm {
   readonly name: string;
   readonly description: string;
+
+  /** Inject deterministic random source from the engine. */
+  setRandomSource(rng: () => number): void;
 
   /** Create initial state for a node */
   getInitialState(nodeId: string, config: ClusterConfig): NodeState;
@@ -15,7 +18,7 @@ export interface ConsensusAlgorithm {
 
   /** Handle client request (write command).
    *  Return actions — may include a redirect response if node is not leader. */
-  onClientRequest(node: NodeState, command: string): Action[];
+  onClientRequest(node: NodeState, request: ClientRequest): Action[];
 
   /** Handle node recovery after failure */
   onRecovery(node: NodeState, config: ClusterConfig): Action[];

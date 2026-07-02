@@ -6,6 +6,8 @@
 
 Интерактивный симулятор алгоритмов консенсуса (Raft, Paxos, Multi-Paxos, Zab, EPaxos) для визуального сравнения их поведения. Учебный инструмент для студентов.
 
+Симулятор ориентирован на **учебную точность**, а не на production-совместимость. `Raft`, `Paxos`, `Multi-Paxos` и `Zab` реализованы как достаточно корректные учебные модели. `EPaxos` реализован как продвинутая учебная аппроксимация: в ней сохранены ключевые идеи `fast path`, `slow path` и зависимостей между instance, но полная paper-level семантика оригинального алгоритма сознательно упрощена.
+
 **[Открыть симулятор →](https://khorost.github.io/consensus-landscape/)** | **[Документация →](https://khorost.github.io/consensus-landscape/docs/)**
 
 ![Consensus Landscape — параллельное сравнение Raft и Paxos](docs/public/img/simulator-screenshot.png)

@@ -1,8 +1,9 @@
 import React, { useMemo } from 'react';
-import { SimulationMetrics } from '../simulation/types';
+import { SimulationMetrics, ScenarioMarker } from '../simulation/types';
 
 interface LatencyChartProps {
   metrics: SimulationMetrics;
+  scenarioMarkers?: ScenarioMarker[];
   currentTime: number;
   width?: number;
   height?: number;
@@ -11,14 +12,17 @@ interface LatencyChartProps {
 const PADDING = { top: 8, right: 8, bottom: 18, left: 32 };
 
 export const LatencyChart: React.FC<LatencyChartProps> = React.memo(({
-  metrics, currentTime, width = 400, height = 80,
+  metrics, scenarioMarkers = [], currentTime, width = 400, height = 80,
 }) => {
   const { commitTimestamps, commitLatencies, leaderChangeTimestamps, nodeEvents, conflictTimestamps, statusZones } = metrics;
 
   const chartW = width - PADDING.left - PADDING.right;
   const chartH = height - PADDING.top - PADDING.bottom;
 
-  const hasAnyActivity = commitTimestamps.length > 0 || conflictTimestamps.length > 0 || statusZones.length > 0;
+  const hasAnyActivity = commitTimestamps.length > 0
+    || conflictTimestamps.length > 0
+    || statusZones.length > 0
+    || scenarioMarkers.length > 0;
 
   const data = useMemo(() => {
     if (!hasAnyActivity && currentTime < 100) return null;
@@ -68,8 +72,15 @@ export const LatencyChart: React.FC<LatencyChartProps> = React.memo(({
       type: z.type,
     }));
 
-    return { points, polyline, leaderLines, failureLines, recoveryLines, conflictDots, zones, lMax, tMax, tMin };
-  }, [commitTimestamps, commitLatencies, leaderChangeTimestamps, nodeEvents, conflictTimestamps, statusZones, currentTime, chartW, chartH, hasAnyActivity]);
+    const scenarioLines = scenarioMarkers
+      .filter(marker => marker.time >= tMin)
+      .map(marker => ({
+        ...marker,
+        x: PADDING.left + ((marker.time - tMin) / (tMax - tMin)) * chartW,
+      }));
+
+    return { points, polyline, leaderLines, failureLines, recoveryLines, conflictDots, zones, scenarioLines, lMax, tMax, tMin };
+  }, [commitTimestamps, commitLatencies, leaderChangeTimestamps, nodeEvents, conflictTimestamps, statusZones, scenarioMarkers, currentTime, chartW, chartH, hasAnyActivity]);
 
   if (!data) {
     return (
@@ -142,6 +153,32 @@ export const LatencyChart: React.FC<LatencyChartProps> = React.memo(({
           />
         ))}
 
+        {/* Scenario markers */}
+        {data.scenarioLines.map((marker, i) => (
+          <g key={`scenario-${i}`}>
+            <title>{marker.detail ?? marker.label}</title>
+            <line
+              x1={marker.x}
+              y1={PADDING.top}
+              x2={marker.x}
+              y2={PADDING.top + chartH}
+              stroke={scenarioColor(marker.type)}
+              strokeWidth={0.9}
+              strokeDasharray="1.5 2.5"
+              opacity={0.7}
+            />
+            <text
+              x={marker.x}
+              y={PADDING.top + 6}
+              textAnchor="middle"
+              fontSize={6}
+              fill={scenarioColor(marker.type)}
+            >
+              {marker.label}
+            </text>
+          </g>
+        ))}
+
         {/* Latency line */}
         <polyline
           points={data.polyline}
@@ -176,3 +213,18 @@ export const LatencyChart: React.FC<LatencyChartProps> = React.memo(({
     </div>
   );
 });
+
+function scenarioColor(type: ScenarioMarker['type']): string {
+  switch (type) {
+    case 'kill_node':
+      return 'var(--msg-nack)';
+    case 'recover_node':
+      return 'var(--node-leader)';
+    case 'partition':
+      return 'var(--msg-vote)';
+    case 'heal_partition':
+      return 'var(--node-follower)';
+    case 'client_write':
+      return 'var(--msg-client)';
+  }
+}

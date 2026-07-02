@@ -1,5 +1,5 @@
 import React, { useMemo, useState, useCallback } from 'react';
-import { NodeId, NodeState, ClientState } from '../simulation/types';
+import { NodeId, NodeState, ClientState, ClientRequest } from '../simulation/types';
 import { ActiveMessage, ClientConnection } from '../simulation/engine';
 import { TimeoutProgressMap } from '../hooks/useSimulation';
 import { AUTO_CLIENT_INTERVAL } from '../simulation/constants';
@@ -50,6 +50,8 @@ const MSG_VISUALS: Record<string, MsgVisual> = {
   // Raft replication with data — green square (envelope)
   append_entries:          { color: 'var(--msg-replication)', shape: 'square', size: 6, label: '' },
   append_entries_response: { color: 'var(--msg-replication)', shape: 'square', size: 4, label: '' },
+  install_snapshot:          { color: 'var(--msg-replication)', shape: 'square', size: 7, label: 'S' },
+  install_snapshot_response: { color: 'var(--msg-replication)', shape: 'circle', size: 3, label: '' },
   // Paxos phase 1 — purple diamond
   prepare: { color: 'var(--msg-vote)',   shape: 'diamond',  size: 5, label: 'P' },
   promise: { color: 'var(--msg-vote)',   shape: 'diamond',  size: 4, label: '' },
@@ -392,18 +394,18 @@ export const ClusterView: React.FC<ClusterViewProps> = React.memo(({
                 const promises = (node.meta.promisesReceived as number) ?? 0;
                 const accepts = (node.meta.acceptsReceived as number) ?? 0;
                 const phase = node.meta.proposalPhase as 'prepare' | 'accept' | null;
-                const pendingVal = node.meta.pendingValue as string | null;
-                const queue = (node.meta.commandQueue as string[]) ?? [];
+                const pendingVal = node.meta.pendingValue as ClientRequest | null;
+                const queue = (node.meta.commandQueue as ClientRequest[]) ?? [];
                 const inPrepare = phase === 'prepare';
                 const collected = inPrepare ? promises : accepts;
                 const phaseLabel = inPrepare ? 'P' : 'A';
-                const cmdLabel = pendingVal ? pendingVal.replace('cmd_', '#') : '?';
+                const cmdLabel = pendingVal ? pendingVal.command.replace('cmd_', '#') : '?';
                 // Arc progress excludes self-count so it starts from 0
                 const externalNeeded = majority - 1; // how many external responses needed
                 const externalCollected = Math.max(0, collected - 1); // minus self
                 const ratio = externalNeeded > 0 ? externalCollected / externalNeeded : 1;
                 const badgeY = pos.y + nodeRadius + 20;
-                const queued = queue.filter(c => c !== pendingVal);
+                const queued = queue.filter(request => request.requestId !== pendingVal?.requestId);
                 const lineH = 13;
                 const badgeW = 62;
                 return (
@@ -420,17 +422,17 @@ export const ClusterView: React.FC<ClusterViewProps> = React.memo(({
                       {cmdLabel} {phaseLabel} {collected}/{majority}
                     </text>
                     {/* Queued commands */}
-                    {queued.slice(0, 3).map((cmd, qi) => {
+                    {queued.slice(0, 3).map((request, qi) => {
                       const qy = badgeY + lineH * (qi + 1);
                       return (
-                        <g key={cmd}>
+                        <g key={request.requestId}>
                           <rect x={pos.x - badgeW / 2} y={qy - lineH / 2}
                             width={badgeW} height={lineH} rx={3}
                             fill="var(--bg-secondary, #555)" opacity={0.6} />
                           <text x={pos.x} y={qy}
                             textAnchor="middle" dominantBaseline="central"
                             fontSize={7} fill="var(--text-secondary)">
-                            {cmd.replace('cmd_', '#')} ожидание
+                            {request.command.replace('cmd_', '#')} ожидание
                           </text>
                         </g>
                       );
@@ -445,29 +447,36 @@ export const ClusterView: React.FC<ClusterViewProps> = React.memo(({
                 const majority = Math.floor(totalNodes / 2) + 1;
                 const lastCommitTime = (node.meta.lastCommitTime as number) ?? 0;
                 const hbInterval = (node.meta.heartbeatInterval as number) ?? 100;
-                const hasUncommitted = node.commitIndex < node.log.length - 1;
+                const hasUncommitted = node.log.some(entry => entry.index > node.commitIndex);
                 // Hide committed badge after one heartbeat interval (no pending → gone with next heartbeat)
                 const commitAge = currentTime - lastCommitTime;
                 const showCommitted = hasUncommitted || commitAge < hbInterval;
                 const entries: Array<{ cmd: string; replicated: number; committed: boolean; opacity: number }> = [];
                 // Show last committed entry until next heartbeat
                 if (node.commitIndex >= 0 && showCommitted) {
-                  const ce = node.log[node.commitIndex];
-                  let rep = 1;
-                  for (const peer of peers) {
-                    if ((node.matchIndex.get(peer) ?? -1) >= node.commitIndex) rep++;
+                  const committedEntry = [...node.log].reverse().find(entry => entry.index === node.commitIndex);
+                  if (committedEntry) {
+                    let rep = 1;
+                    for (const peer of peers) {
+                      if ((node.matchIndex.get(peer) ?? -1) >= committedEntry.index) rep++;
+                    }
+                    const fadeOpacity = hasUncommitted ? 0.85 : Math.max(0.3, 0.85 * (1 - commitAge / hbInterval));
+                    entries.push({
+                      cmd: committedEntry.command.replace('cmd_', '#'),
+                      replicated: rep,
+                      committed: true,
+                      opacity: fadeOpacity,
+                    });
                   }
-                  const fadeOpacity = hasUncommitted ? 0.85 : Math.max(0.3, 0.85 * (1 - commitAge / hbInterval));
-                  entries.push({ cmd: ce.command.replace('cmd_', '#'), replicated: rep, committed: true, opacity: fadeOpacity });
                 }
                 // Uncommitted entries
-                for (let ei = node.commitIndex + 1; ei < node.log.length; ei++) {
+                for (const entry of node.log.filter(logEntry => logEntry.index > node.commitIndex)) {
                   let rep = 1;
                   for (const peer of peers) {
-                    if ((node.matchIndex.get(peer) ?? -1) >= ei) rep++;
+                    if ((node.matchIndex.get(peer) ?? -1) >= entry.index) rep++;
                   }
                   entries.push({
-                    cmd: node.log[ei].command.replace('cmd_', '#'),
+                    cmd: entry.command.replace('cmd_', '#'),
                     replicated: rep, committed: false, opacity: 0.85,
                   });
                 }

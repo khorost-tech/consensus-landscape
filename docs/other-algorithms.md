@@ -1,14 +1,14 @@
 # Другие алгоритмы консенсуса
 
-Ниже перечислены известные алгоритмы консенсуса, которые **не реализованы** в текущей версии симулятора, но представляют значительный интерес для изучения. Реализованные алгоритмы: [Raft](/algorithms/raft), [Basic Paxos](/algorithms/paxos), [Multi-Paxos](/algorithms/multi-paxos), [Zab](/algorithms/zab), [EPaxos](/algorithms/epaxos).
+Ниже перечислены известные алгоритмы консенсуса, которые **не реализованы** в текущей версии симулятора, но представляют значительный интерес для изучения. Реализованные алгоритмы: [Raft](./algorithms/raft), [Basic Paxos](./algorithms/paxos), [Multi-Paxos](./algorithms/multi-paxos), [Zab](./algorithms/zab), [EPaxos](./algorithms/epaxos).
 
 ## Viewstamped Replication (VR)
 
 **Год:** 1988 (оригинал), 2012 (revisited)
 
-Leader-based алгоритм, предшественник Raft. Использует концепцию «view» (аналог term в Raft) и протокол смены view при отказе лидера. Исторически значим как один из первых алгоритмов реплицированного автомата.
+Алгоритм с лидером, предшественник Raft. Использует концепцию `view` (аналог `term` в Raft) и протокол смены `view` при отказе лидера. Исторически значим как один из первых алгоритмов реплицированного автомата.
 
-VR и Raft структурно очень похожи: оба используют выделенного лидера, логарифмическую репликацию и кворумные подтверждения. Основное различие — в механизме view change vs election.
+VR и Raft структурно очень похожи: оба используют выделенного лидера, репликацию лога и кворумные подтверждения. Основное различие — в механизме `view change` против обычных выборов.
 
 **Источники:**
 - Oki B., Liskov B. "Viewstamped Replication: A New Primary Copy Method to Support Highly-Available Distributed Systems" (1988) — [ACM PODC](https://doi.org/10.1145/62546.62549)
@@ -34,9 +34,9 @@ VR и Raft структурно очень похожи: оба использу
 
 **Год:** 2014 (Tendermint), переименован в CometBFT в 2023
 
-BFT-алгоритм консенсуса, разработанный для блокчейн-систем. Раунд-based протокол: Propose → Prevote → Precommit. Толерантен к `f < n/3` византийским узлам.
+BFT-алгоритм консенсуса, разработанный для блокчейн-систем. Раундовый протокол: Propose → Prevote → Precommit. Толерантен к `f < n/3` византийским узлам.
 
-Широко используется в экосистеме Cosmos (межблокчейн-коммуникация). Отличается от PBFT более простой структурой и раунд-based подходом вместо view change.
+Широко используется в экосистеме Cosmos (межблокчейн-коммуникация). Отличается от PBFT более простой структурой и раундовым подходом вместо `view change`.
 
 **Источники:**
 - Buchman E. "Tendermint: Byzantine Fault Tolerance in the Age of Blockchains" (2016) — [MSc Thesis](https://knowen-production.s3.amazonaws.com/uploads/attachment/file/1814/Buchman_Ethan_201606_MAsc.pdf)
@@ -66,7 +66,7 @@ BFT-алгоритм с **линейной** сложностью по сооб�
 | **VR** | 1988 | Crash | Да | O(n) | 2f + 1 |
 | **Raft** ✅ | 2014 | Crash | Да | O(n) | 2f + 1 |
 | **Zab** ✅ | 2011 | Crash | Да | O(n) | 2f + 1 |
-| **EPaxos** ✅ | 2013 | Crash | Нет | O(n) fast path | 2f + 1 |
+| **EPaxos** ✅ | 2013 | Crash | Нет | O(n) (`fast path`) | 2f + 1 |
 | **PBFT** | 1999 | Byzantine | Да (rotating) | O(n²) | 3f + 1 |
 | **Tendermint** | 2014 | Byzantine | Да (rotating) | O(n²) | 3f + 1 |
 | **HotStuff** | 2019 | Byzantine | Да (rotating) | O(n) | 3f + 1 |

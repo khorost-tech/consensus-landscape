@@ -3,8 +3,16 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { execSync } from 'child_process'
 
-const commitHash = execSync('git rev-parse --short HEAD').toString().trim()
-const commitDate = execSync('git log -1 --format=%ci').toString().trim().slice(0, 10)
+function safeExec(command: string, fallback: string): string {
+  try {
+    return execSync(command).toString().trim()
+  } catch {
+    return fallback
+  }
+}
+
+const commitHash = safeExec('git rev-parse --short HEAD', 'unknown')
+const commitDate = safeExec('git log -1 --format=%ci', 'unknown').slice(0, 10)
 const buildRef = (() => {
   try {
     return execSync('git describe --tags --exact-match 2>/dev/null').toString().trim()

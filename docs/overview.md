@@ -38,7 +38,7 @@
 1999  PBFT — первый практичный BFT-алгоритм (Castro, Liskov)
 2001  «Paxos Made Simple» — доступное изложение
 2011  Zab — консенсус для ZooKeeper
-2013  EPaxos — leaderless Paxos с оптимальной задержкой
+2013  EPaxos — Paxos без лидера с оптимальной задержкой
 2014  Raft — «понятный» алгоритм консенсуса
 2018  Tendermint — BFT-консенсус для блокчейнов
 2019  HotStuff — линейная сложность BFT
@@ -48,11 +48,11 @@
 
 В данном проекте реализованы пять алгоритмов консенсуса:
 
-- **[Raft](./algorithms/raft)** — leader-based алгоритм с выборами лидера и репликацией лога. Разработан для простоты понимания.
-- **[Basic Paxos](./algorithms/paxos)** — leaderless алгоритм, где любой узел может предложить значение. Исторически первый алгоритм консенсуса.
-- **[Multi-Paxos](./algorithms/multi-paxos)** — оптимизация Basic Paxos со стабильным лидером. Пропускает фазу Prepare после выборов, сокращая латентность с 2 RTT до 1 RTT.
-- **[Zab](./algorithms/zab)** — протокол atomic broadcast из Apache ZooKeeper. Три явные фазы: Election → Synchronization → Broadcast.
-- **[EPaxos](./algorithms/epaxos)** — leaderless Paxos с оптимальной латентностью. Коммит за 1 RTT (fast path) без лидера; 2 RTT при конфликтах (slow path).
+- **[Raft](./algorithms/raft)** — алгоритм с лидером, выборами лидера и репликацией лога. В симуляторе реализован как наиболее строгая учебная модель.
+- **[Basic Paxos](./algorithms/paxos)** — алгоритм без лидера, где любой узел может предложить значение. В симуляторе реализован как slot-based учебная модель классического Paxos.
+- **[Multi-Paxos](./algorithms/multi-paxos)** — оптимизация Basic Paxos со стабильным лидером. В учебной модели использует отдельные слоты и сокращает steady-state латентность с 2 RTT до 1 RTT.
+- **[Zab](./algorithms/zab)** — протокол atomic broadcast из Apache ZooKeeper. В учебной модели видны три явные фазы: Election → Synchronization → Broadcast.
+- **[EPaxos](./algorithms/epaxos)** — Paxos без лидера с низкой латентностью. Это более упрощённая учебная модель: `fast path` виден как коммит за 1 RTT без лидера; при конфликтах используется `slow path` на 2 RTT.
 
 Также см. [список известных, но не реализованных алгоритмов](./other-algorithms).
 

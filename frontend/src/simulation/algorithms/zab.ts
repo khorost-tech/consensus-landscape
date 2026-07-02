@@ -1,6 +1,6 @@
 import { ConsensusAlgorithm } from './interface';
 import {
-  NodeState, NodeId, Message, Action, ClusterConfig, TimeoutType, LogEntry,
+  NodeState, NodeId, Message, Action, ClusterConfig, TimeoutType, LogEntry, ClientRequest,
 } from '../types';
 
 /**
@@ -20,6 +20,11 @@ import {
 export class ZabAlgorithm implements ConsensusAlgorithm {
   readonly name = 'Zab';
   readonly description = 'ZooKeeper Atomic Broadcast — leader-based total order with epochs';
+  private rng: () => number = Math.random;
+
+  setRandomSource(rng: () => number): void {
+    this.rng = rng;
+  }
 
   getInitialState(nodeId: NodeId, config: ClusterConfig): NodeState {
     const allNodes = Array.from({ length: config.nodeCount }, (_, i) => `node_${i}`);
@@ -32,6 +37,8 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
       currentTerm: 0,       // epoch
       votedFor: null,
       log: [],
+      logBaseIndex: 0,
+      logBaseTerm: 0,
       commitIndex: -1,
       lastApplied: -1,
       nextIndex: new Map(),
@@ -50,8 +57,23 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
         syncAcks: 0,
         followerInfoCount: 0,
         // Broadcast
-        pendingProposals: {} as Record<string, { acks: number; epoch: number; counter: number }>,
-        commandQueue: [] as string[],
+        pendingProposals: {} as Record<string, {
+          acks: number;
+          epoch: number;
+          counter: number;
+          index: number;
+          requestId: string;
+          entryId: string;
+          command: string;
+        }>,
+        pendingCommits: {} as Record<string, {
+          epoch: number;
+          counter: number;
+          index: number;
+          requestId: string;
+          entryId: string;
+        }>,
+        commandQueue: [] as ClientRequest[],
         knownLeader: null as NodeId | null,
         heartbeatInterval: config.heartbeatInterval,
       },
@@ -94,7 +116,7 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
     return [];
   }
 
-  onClientRequest(node: NodeState, command: string): Action[] {
+  onClientRequest(node: NodeState, request: ClientRequest): Action[] {
     if (node.role !== 'leading' || (node.meta.phase as string) !== 'broadcast') {
       return [{
         type: 'send_message',
@@ -112,10 +134,34 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
     const counter = node.meta.counter as number;
     const zxidKey = `${epoch}:${counter}`;
 
-    const proposals = node.meta.pendingProposals as Record<string, { acks: number; epoch: number; counter: number }>;
-    proposals[zxidKey] = { acks: 1, epoch, counter }; // self-ack
+    const proposals = node.meta.pendingProposals as Record<string, {
+      acks: number;
+      epoch: number;
+      counter: number;
+      index: number;
+      requestId: string;
+      entryId: string;
+      command: string;
+    }>;
+    proposals[zxidKey] = {
+      acks: 1,
+      epoch,
+      counter,
+      index: node.logBaseIndex + node.log.length,
+      requestId: request.requestId,
+      entryId: request.entryId,
+      command: request.command,
+    }; // self-ack
 
-    const entry: LogEntry = { term: epoch, index: node.log.length, command, committed: false };
+    const entry: LogEntry = {
+      entryId: request.entryId,
+      requestId: request.requestId,
+      zxid: zxidKey,
+      term: epoch,
+      index: proposals[zxidKey].index,
+      command: request.command,
+      committed: false,
+    };
     node.log.push(entry);
 
     const peers = node.meta.peers as NodeId[];
@@ -125,7 +171,15 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
         type: 'send_message',
         message: {
           type: 'zab_proposal', from: node.id, to: peer, term: epoch,
-          payload: { epoch, counter, value: command, zxidKey },
+          payload: {
+            epoch,
+            counter,
+            index: entry.index,
+            value: request.command,
+            requestId: request.requestId,
+            entryId: request.entryId,
+            zxidKey,
+          },
         },
       });
     }
@@ -139,6 +193,8 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
     node.meta.proposedLeader = node.id;
     node.meta.syncAcks = 0;
     node.meta.followerInfoCount = 0;
+    node.meta.pendingProposals = {};
+    node.meta.pendingCommits = {};
 
     return [{
       type: 'set_timeout',
@@ -154,6 +210,8 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
     node.meta.proposedLeader = node.id;
     node.meta.knownLeader = null;
     node.meta.electionVotes = {};
+    node.meta.pendingProposals = {};
+    node.meta.pendingCommits = {};
     node.votesReceived.clear();
     node.votesReceived.add(node.id);
 
@@ -178,7 +236,7 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
 
     actions.push({
       type: 'set_timeout',
-      timeout: { type: 'election', duration: 300 + Math.random() * 300, nodeId: node.id },
+      timeout: { type: 'election', duration: 300 + this.rng() * 300, nodeId: node.id },
     });
 
     return actions;
@@ -280,7 +338,11 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
           type: 'send_message',
           message: {
             type: 'zab_followerinfo', from: node.id, to: leaderId, term: epoch,
-            payload: { lastEpoch: epoch, lastCounter: counter, logLength: node.log.length },
+            payload: {
+              lastEpoch: epoch,
+              lastCounter: counter,
+              lastLogIndex: node.log.length > 0 ? node.log[node.log.length - 1].index : node.logBaseIndex - 1,
+            },
           },
         },
       ];
@@ -292,21 +354,31 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
   private handleFollowerInfo(node: NodeState, msg: Message): Action[] {
     if (node.role !== 'leading') return [];
 
-    const { logLength } = msg.payload as { lastEpoch: number; lastCounter: number; logLength: number };
+    const { lastLogIndex } = msg.payload as { lastEpoch: number; lastCounter: number; lastLogIndex: number };
     node.meta.followerInfoCount = (node.meta.followerInfoCount as number) + 1;
 
     const actions: Action[] = [];
 
     // Send missing log entries as sync
-    if (logLength < node.log.length) {
-      const missing = node.log.slice(logLength).filter(e => e.committed);
+    if (lastLogIndex < node.commitIndex) {
+      const missing = node.log.filter(e => e.committed && e.index > lastLogIndex);
       for (const entry of missing) {
         actions.push({
           type: 'send_message',
           message: {
             type: 'zab_sync', from: node.id, to: msg.from,
             term: node.currentTerm,
-            payload: { entry: { term: entry.term, index: entry.index, command: entry.command, committed: true } },
+            payload: {
+              entry: {
+                entryId: entry.entryId,
+                requestId: entry.requestId,
+                zxid: entry.zxid ?? `${entry.term}:${entry.index}`,
+                term: entry.term,
+                index: entry.index,
+                command: entry.command,
+                committed: true,
+              },
+            },
           },
         });
       }
@@ -335,15 +407,17 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
   private handleSync(node: NodeState, msg: Message): Action[] {
     if (node.role === 'leading') return [];  // only leader ignores sync
 
-    const { entry } = msg.payload as { entry: { term: number; index: number; command: string; committed: boolean } };
-    const alreadyHas = node.log.some(e => e.command === entry.command && e.committed);
-    if (!alreadyHas) {
-      node.log.push({
-        term: entry.term, index: node.log.length,
-        command: entry.command, committed: true,
-      });
-      node.commitIndex = node.log.length - 1;
-    }
+    const { entry } = msg.payload as { entry: LogEntry };
+    this.upsertLogEntry(node, {
+      entryId: entry.entryId,
+      requestId: entry.requestId,
+      zxid: entry.zxid,
+      term: entry.term,
+      index: entry.index,
+      command: entry.command,
+      committed: true,
+    });
+    this.trackZxid(node, entry.term, this.zxidCounter(entry.zxid, entry.index));
     return [];
   }
 
@@ -393,26 +467,41 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
   private handleProposal(node: NodeState, msg: Message): Action[] {
     if (node.role !== 'following') return [];
 
-    const { epoch, counter, value, zxidKey } = msg.payload as {
-      epoch: number; counter: number; value: string; zxidKey: string;
+    const { epoch, counter, index, value, zxidKey } = msg.payload as {
+      epoch: number; counter: number; index: number; value: string; zxidKey: string; requestId: string; entryId: string;
     };
 
-    // Add to log as uncommitted
-    const entry: LogEntry = { term: epoch, index: node.log.length, command: value, committed: false };
-    node.log.push(entry);
+    const entry: LogEntry = {
+      entryId: (msg.payload.entryId as string),
+      requestId: (msg.payload.requestId as string),
+      zxid: zxidKey,
+      term: epoch,
+      index,
+      command: value,
+      committed: false,
+    };
+    const pendingCommits = node.meta.pendingCommits as Record<string, {
+      epoch: number;
+      counter: number;
+      index: number;
+      requestId: string;
+      entryId: string;
+    }>;
+    const pendingCommit = pendingCommits[zxidKey];
+    if (pendingCommit && pendingCommit.entryId === entry.entryId) {
+      entry.committed = true;
+      delete pendingCommits[zxidKey];
+    }
+    this.upsertLogEntry(node, entry);
 
     // Update epoch/counter tracking
-    if (epoch > (node.meta.epoch as number) || (epoch === (node.meta.epoch as number) && counter > (node.meta.counter as number))) {
-      node.meta.epoch = epoch;
-      node.meta.counter = counter;
-      node.currentTerm = epoch;
-    }
+    this.trackZxid(node, epoch, counter);
 
     return [{
       type: 'send_message',
       message: {
         type: 'zab_ack', from: node.id, to: msg.from, term: epoch,
-        payload: { zxidKey, epoch, counter },
+        payload: { zxidKey, epoch, counter, index: entry.index, entryId: entry.entryId },
       },
     }];
   }
@@ -421,7 +510,15 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
     if (node.role !== 'leading') return [];
 
     const { zxidKey } = msg.payload as { zxidKey: string };
-    const proposals = node.meta.pendingProposals as Record<string, { acks: number; epoch: number; counter: number }>;
+    const proposals = node.meta.pendingProposals as Record<string, {
+      acks: number;
+      epoch: number;
+      counter: number;
+      index: number;
+      requestId: string;
+      entryId: string;
+      command: string;
+    }>;
     const prop = proposals[zxidKey];
     if (!prop) return [];
 
@@ -433,15 +530,16 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
     if (prop.acks >= majority) {
       delete proposals[zxidKey];
 
-      // Mark committed in log
-      // Find the corresponding log entry (match by position based on counter)
-      for (const entry of node.log) {
-        if (!entry.committed && entry.term === prop.epoch) {
-          entry.committed = true;
-          node.commitIndex = Math.max(node.commitIndex, entry.index);
-          break;
-        }
-      }
+      // Mark committed in log for the specific proposal entry
+      this.upsertLogEntry(node, {
+        entryId: prop.entryId,
+        requestId: prop.requestId,
+        zxid: zxidKey,
+        term: prop.epoch,
+        index: prop.index,
+        command: prop.command,
+        committed: true,
+      });
 
       const actions: Action[] = [{ type: 'commit_entry' }];
 
@@ -451,7 +549,14 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
           type: 'send_message',
           message: {
             type: 'zab_commit', from: node.id, to: peer, term: prop.epoch,
-            payload: { zxidKey, epoch: prop.epoch, counter: prop.counter },
+            payload: {
+              zxidKey,
+              epoch: prop.epoch,
+              counter: prop.counter,
+              index: prop.index,
+              requestId: prop.requestId,
+              entryId: prop.entryId,
+            },
           },
         });
       }
@@ -462,22 +567,33 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
   }
 
   private handleCommit(node: NodeState, _msg: Message): Action[] {
-    const { zxidKey } = _msg.payload as { zxidKey: string; epoch: number; counter: number };
+    const { zxidKey, epoch, counter, index, requestId, entryId } = _msg.payload as {
+      zxidKey: string; epoch: number; counter: number; index: number; requestId: string; entryId: string;
+    };
 
-    // Mark the oldest uncommitted entry as committed
-    for (const entry of node.log) {
-      if (!entry.committed) {
-        entry.committed = true;
-        node.commitIndex = Math.max(node.commitIndex, entry.index);
-        break;
-      }
+    const committedEntry = this.findLogEntry(node, zxidKey, entryId);
+    if (committedEntry) {
+      committedEntry.committed = true;
+      committedEntry.index = index;
+      committedEntry.zxid = zxidKey;
+      node.commitIndex = Math.max(node.commitIndex, committedEntry.index);
+    } else {
+      const pendingCommits = node.meta.pendingCommits as Record<string, {
+        epoch: number;
+        counter: number;
+        index: number;
+        requestId: string;
+        entryId: string;
+      }>;
+      pendingCommits[zxidKey] = { epoch, counter, index, requestId, entryId };
     }
+    this.trackZxid(node, epoch, counter);
 
     // Remove from queue if present
-    const queue = node.meta.commandQueue as string[];
+    const queue = node.meta.commandQueue as ClientRequest[];
     // Not typically needed for followers but clean up
-    void zxidKey;
-    void queue;
+    const idx = queue.findIndex(v => v.requestId === requestId);
+    if (idx !== -1) queue.splice(idx, 1);
 
     return [];
   }
@@ -508,6 +624,10 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
     if (node.role === 'leading') return [];
 
     node.meta.knownLeader = msg.from;
+    if (typeof msg.payload.epoch === 'number') {
+      node.meta.epoch = Math.max(node.meta.epoch as number, msg.payload.epoch as number);
+      node.currentTerm = node.meta.epoch as number;
+    }
     if (node.role === 'looking') {
       node.role = 'following';
       node.meta.phase = 'broadcast';
@@ -515,11 +635,54 @@ export class ZabAlgorithm implements ConsensusAlgorithm {
 
     return [{
       type: 'set_timeout',
-      timeout: { type: 'election', duration: 300 + Math.random() * 300, nodeId: node.id },
+      timeout: { type: 'election', duration: 300 + this.rng() * 300, nodeId: node.id },
     }];
   }
 
   private randomTimeout(config: ClusterConfig): number {
-    return config.electionTimeoutMin + Math.random() * (config.electionTimeoutMax - config.electionTimeoutMin);
+    return config.electionTimeoutMin + this.rng() * (config.electionTimeoutMax - config.electionTimeoutMin);
+  }
+
+  private upsertLogEntry(node: NodeState, entry: LogEntry): void {
+    if (entry.index < node.logBaseIndex) return;
+
+    const existingIndex = node.log.findIndex(candidate =>
+      candidate.entryId === entry.entryId
+      || (entry.zxid !== undefined && candidate.zxid === entry.zxid)
+      || candidate.index === entry.index);
+
+    if (existingIndex !== -1) {
+      const current = node.log[existingIndex];
+      node.log[existingIndex] = {
+        ...current,
+        ...entry,
+        committed: current.committed || entry.committed,
+      };
+    } else {
+      node.log.push(entry);
+      node.log.sort((a, b) => a.index - b.index);
+    }
+
+    if (entry.committed) {
+      node.commitIndex = Math.max(node.commitIndex, entry.index);
+    }
+  }
+
+  private findLogEntry(node: NodeState, zxidKey: string, entryId: string): LogEntry | undefined {
+    return node.log.find(entry => entry.entryId === entryId || entry.zxid === zxidKey);
+  }
+
+  private trackZxid(node: NodeState, epoch: number, counter: number): void {
+    if (epoch > (node.meta.epoch as number) || (epoch === (node.meta.epoch as number) && counter > (node.meta.counter as number))) {
+      node.meta.epoch = epoch;
+      node.meta.counter = counter;
+      node.currentTerm = epoch;
+    }
+  }
+
+  private zxidCounter(zxid: string | undefined, fallbackIndex: number): number {
+    if (!zxid) return fallbackIndex;
+    const [, counter] = zxid.split(':');
+    return Number.parseInt(counter ?? '', 10) || fallbackIndex;
   }
 }

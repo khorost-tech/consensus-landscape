@@ -5,7 +5,17 @@ export type NodeRole = 'follower' | 'candidate' | 'leader' | 'proposer' | 'accep
 
 export type NodeStatus = 'alive' | 'dead';
 
+export interface ClientRequest {
+  requestId: string;
+  entryId: string;
+  command: string;
+}
+
 export interface LogEntry {
+  entryId: string;
+  requestId: string;
+  zxid?: string;
+  instanceKey?: string;
   term: number;
   index: number;
   command: string;
@@ -19,6 +29,10 @@ export interface NodeState {
   currentTerm: number;
   votedFor: NodeId | null;
   log: LogEntry[];
+  /** Global index of the first in-memory log entry (after trimming/compaction). */
+  logBaseIndex: number;
+  /** Term of the last compacted entry at index logBaseIndex - 1. */
+  logBaseTerm: number;
   commitIndex: number;
   lastApplied: number;
   // Raft leader state
@@ -36,6 +50,8 @@ export type MessageType =
   | 'request_vote_response'
   | 'append_entries'
   | 'append_entries_response'
+  | 'install_snapshot'
+  | 'install_snapshot_response'
   // Paxos messages
   | 'prepare'
   | 'promise'
@@ -83,7 +99,9 @@ export type EventType =
   | 'client_request'
   | 'node_failure'
   | 'node_recovery'
-  | 'message_send';
+  | 'message_send'
+  | 'network_partition'
+  | 'heal_partition';
 
 export interface SimEvent {
   id: string;
@@ -94,7 +112,11 @@ export interface SimEvent {
     message?: Message;
     timeoutType?: TimeoutType;
     command?: string;
+    requestId?: string;
+    entryId?: string;
     clientId?: string; // which client sent this request
+    targetNode?: NodeId;
+    partitions?: NodeId[][];
   };
 }
 
@@ -141,6 +163,13 @@ export interface SimulationMetrics {
   conflictTimestamps: number[];
   /** Cluster status zones: periods without quorum or during elections */
   statusZones: Array<{ start: number; end: number; type: 'no_quorum' | 'electing' }>;
+}
+
+export interface ScenarioMarker {
+  time: number;
+  type: ScenarioEvent['type'];
+  label: string;
+  detail?: string;
 }
 
 /** Live counters updated every step — for panel header display */
