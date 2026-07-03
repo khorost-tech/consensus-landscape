@@ -6,7 +6,7 @@ export default withMermaid(
     title: 'Consensus Landscape',
     description: 'Интерактивный симулятор алгоритмов консенсуса',
     lang: 'ru-RU',
-    base: process.env.DOCS_BASE ?? '/docs/',
+    base: process.env.DOCS_BASE ?? '/consensus-landscape/docs/',
     cleanUrls: true,
     lastUpdated: true,
 
